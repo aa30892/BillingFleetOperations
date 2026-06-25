@@ -85,7 +85,7 @@ if date_range and len(date_range) == 2:
 filtered["PRICE_DIFF"] = filtered["NET_PRICE_EURO"].fillna(0) - filtered["BILLED_AMT_EURO"].fillna(0)
 filtered["QTY_DIFF"] = filtered["PO_QTY"].fillna(0) - filtered["BILLED_QTY"].fillna(0)
 
-tab_dashboard, tab_anomaly = st.tabs(["Dashboard", "AI Anomaly Analysis"])
+tab_dashboard, tab_repair, tab_anomaly = st.tabs(["Dashboard", "Repair Materials Ranking", "AI Anomaly Analysis"])
 
 with tab_dashboard:
     with st.container(horizontal=True):
@@ -166,6 +166,135 @@ with tab_dashboard:
         hide_index=True,
         use_container_width=True,
     )
+
+with tab_repair:
+    st.subheader("Materials Used on Repair Jobs (by Vehicle)")
+    st.markdown("When `JOB_TYPE_CODE = 'repair'`, what other materials are used? Ranked from highest to lowest quantity.")
+
+    job_type_col = None
+    for col_name in ["JOB_TYPE_CODE", "JOB_TYPE_CD", "JOB_TYPE_CODE_PO", "JOB_TYPE_CD_PO", "JOB_TYPE_CODE_BILL", "JOB_TYPE_CD_BILL"]:
+        if col_name in filtered.columns:
+            job_type_col = col_name
+            break
+
+    if job_type_col is None:
+        st.warning("No JOB_TYPE column found in the data. Ensure your CSV includes JOB_TYPE_CODE or JOB_TYPE_CD.")
+    else:
+        repair_mask = filtered[job_type_col].astype(str).str.lower().str.contains("repair", na=False)
+        repair_df = filtered[repair_mask]
+
+        if repair_df.empty:
+            st.info("No repair jobs found in the filtered data.")
+        else:
+            st.metric("Total Repair Records", f"{len(repair_df):,}", border=True)
+
+            repair_ranking = (
+                repair_df.groupby("MATERIAL_ID_COMBINED")
+                .agg(
+                    TOTAL_PO_QTY=("PO_QTY", "sum"),
+                    TOTAL_BILLED_QTY=("BILLED_QTY", "sum"),
+                    JOB_COUNT=("JOB_ID_COMBINED", "count"),
+                )
+                .reset_index()
+            )
+            repair_ranking["TOTAL_QTY"] = repair_ranking["TOTAL_PO_QTY"].fillna(0) + repair_ranking["TOTAL_BILLED_QTY"].fillna(0)
+            repair_ranking = repair_ranking.sort_values("TOTAL_QTY", ascending=False).reset_index(drop=True)
+            repair_ranking.index = repair_ranking.index + 1
+            repair_ranking.index.name = "Rank"
+
+            with st.container(border=True):
+                st.markdown("**Top Materials on Repair Jobs**")
+                st.bar_chart(
+                    repair_ranking.head(20).set_index("MATERIAL_ID_COMBINED")[["TOTAL_PO_QTY", "TOTAL_BILLED_QTY"]]
+                )
+
+            st.dataframe(
+                repair_ranking.rename(columns={
+                    "MATERIAL_ID_COMBINED": "Material ID",
+                    "TOTAL_PO_QTY": "Total PO Qty",
+                    "TOTAL_BILLED_QTY": "Total Billed Qty",
+                    "TOTAL_QTY": "Combined Qty",
+                    "JOB_COUNT": "Job Count",
+                }),
+                use_container_width=True,
+            )
+
+    st.divider()
+    st.subheader("Vendors with Service & Repair on Same Vehicle & Same Date")
+    st.markdown("Identifies vendors that logged both `service` and `repair` job types on the same vehicle on the same PO posting date.")
+
+    vehicle_col = None
+    for vc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID", "VEHICLE_REG_NUMBER", "VEHICLE_REG_NBR"]:
+        if vc in filtered.columns:
+            vehicle_col = vc
+            break
+
+    vendor_display_col = None
+    for vnc in ["VENDOR_NAME", "VEND_NAME", "VENDOR_NAME_PO", "VEND_NAME_BILL"]:
+        if vnc in filtered.columns:
+            vendor_display_col = vnc
+            break
+
+    if job_type_col is None or vehicle_col is None or vendor_display_col is None:
+        st.warning("Missing required columns (JOB_TYPE, VEHICLE, or VENDOR). Ensure your CSVs include these fields.")
+    else:
+        svc_mask = filtered[job_type_col].astype(str).str.lower().str.contains("service", na=False)
+        rep_mask = filtered[job_type_col].astype(str).str.lower().str.contains("repair", na=False)
+
+        service_records = filtered[svc_mask][[vendor_display_col, vehicle_col, "PO_POSTING_DATE_COMBINED", "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]].copy()
+        repair_records = filtered[rep_mask][[vendor_display_col, vehicle_col, "PO_POSTING_DATE_COMBINED", "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]].copy()
+
+        if service_records.empty or repair_records.empty:
+            st.info("No overlap found — need both service and repair records in the filtered data.")
+        else:
+            overlap = service_records.merge(
+                repair_records,
+                on=[vendor_display_col, vehicle_col, "PO_POSTING_DATE_COMBINED"],
+                how="inner",
+                suffixes=("_SERVICE", "_REPAIR"),
+            )
+
+            if overlap.empty:
+                st.info("No vendors found with both service and repair on the same vehicle and same date.")
+            else:
+                vendor_summary = (
+                    overlap.groupby(vendor_display_col)
+                    .agg(
+                        OCCURRENCES=(vehicle_col, "count"),
+                        VEHICLES=(vehicle_col, "nunique"),
+                    )
+                    .reset_index()
+                    .sort_values("OCCURRENCES", ascending=False)
+                    .reset_index(drop=True)
+                )
+                vendor_summary.index = vendor_summary.index + 1
+                vendor_summary.index.name = "Rank"
+
+                st.metric("Vendors Flagged", len(vendor_summary), border=True)
+
+                st.dataframe(
+                    vendor_summary.rename(columns={
+                        vendor_display_col: "Vendor Name",
+                        "OCCURRENCES": "Occurrences",
+                        "VEHICLES": "Unique Vehicles",
+                    }),
+                    use_container_width=True,
+                )
+
+                with st.expander("Detail: Overlapping Records"):
+                    st.dataframe(
+                        overlap.rename(columns={
+                            vendor_display_col: "Vendor",
+                            vehicle_col: "Vehicle",
+                            "PO_POSTING_DATE_COMBINED": "Date",
+                            "JOB_ID_COMBINED_SERVICE": "Service Job ID",
+                            "MATERIAL_ID_COMBINED_SERVICE": "Service Material",
+                            "JOB_ID_COMBINED_REPAIR": "Repair Job ID",
+                            "MATERIAL_ID_COMBINED_REPAIR": "Repair Material",
+                        }),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
 
 with tab_anomaly:
     st.subheader("AI Anomaly Detection")
