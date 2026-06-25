@@ -1,16 +1,16 @@
-import os
 import streamlit as st
 import pandas as pd
+from snowflake.snowpark.context import get_active_session
 
 st.set_page_config(page_title="PO vs Billing Dashboard", layout="wide")
 st.title("PO vs Billing Comparison")
 
-conn = st.connection("snowflake", ttl=os.getenv("SNOWFLAKE_CONNECTION_TTL"))
+session = get_active_session()
 
 
 @st.cache_data
 def load_po_data():
-    return conn.query("""
+    return session.sql("""
         SELECT
             JOB_NOTIFICATION_ID,
             MATERIAL_ID,
@@ -25,12 +25,12 @@ def load_po_data():
         WHERE PO_POSTING_YEAR = 2026
           AND PO_POSTING_MONTH BETWEEN 1 AND 5
           AND MATERIAL_GROUP_DESC IN ('service truck', 'service')
-    """)
+    """).to_pandas()
 
 
 @st.cache_data
 def load_billing_data():
-    return conn.query("""
+    return session.sql("""
         SELECT
             JOB_ID,
             MATL_ID_TRIM,
@@ -45,7 +45,7 @@ def load_billing_data():
         WHERE BILLING_YEAR = 2026
           AND BILLING_MONTH BETWEEN 1 AND 5
           AND MATL_GRP_DESC IN ('Service Truck', 'Service')
-    """)
+    """).to_pandas()
 
 
 with st.spinner("Loading data..."):
