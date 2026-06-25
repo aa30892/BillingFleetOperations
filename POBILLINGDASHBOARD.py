@@ -388,6 +388,12 @@ with tab_anomaly:
     st.subheader("PO Net Price > Billed Amount — Vendor Severity Flags")
     st.markdown("Identifies vendors where PO value significantly exceeds what was actually billed per month. "
                 "Large gaps may indicate phantom POs, inflated pricing, or services not rendered.")
+    st.markdown("""
+- **Groups by vendor and month**, calculates the underbilled gap
+- **Assigns severity:** CRITICAL (≥80%), HIGH (≥60%), MEDIUM (≥40%), LOW (<40%)
+- **Flags malpractice reasons** (phantom POs, inflated pricing, services not rendered)
+- **Shows a bar chart** of top 20 vendors and a full detail table
+""")
 
     vendor_col_anomaly = None
     for vc in ["VENDOR_NAME", "VEND_NAME", "VENDOR_NAME_PO", "VEND_NAME_BILL"]:
