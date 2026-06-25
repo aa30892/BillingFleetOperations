@@ -485,3 +485,67 @@ with tab_anomaly:
                 hide_index=True,
                 use_container_width=True,
             )
+
+    st.divider()
+    st.subheader("Material Usage per Job & Vehicle — PO vs Billing Discrepancies")
+    st.markdown("Shows per Job ID which Material IDs and how many times they were used on a vehicle, "
+                "highlighting where PO quantity differs from Billing quantity.")
+
+    vehicle_col_mat = None
+    for vc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID"]:
+        if vc in filtered.columns:
+            vehicle_col_mat = vc
+            break
+
+    required_cols = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED", "PO_QTY", "BILLED_QTY"]
+    if not all(c in filtered.columns for c in required_cols):
+        st.warning("Missing required columns (JOB_ID, MATERIAL_ID, PO_QTY, or BILLED_QTY).")
+    else:
+        group_cols = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]
+        if vehicle_col_mat:
+            group_cols.append(vehicle_col_mat)
+
+        mat_usage = (
+            filtered.groupby(group_cols)
+            .agg(
+                PO_QTY_TOTAL=("PO_QTY", "sum"),
+                BILLED_QTY_TOTAL=("BILLED_QTY", "sum"),
+                PO_LINES=("PO_QTY", "count"),
+            )
+            .reset_index()
+        )
+        mat_usage["QTY_DIFF"] = mat_usage["PO_QTY_TOTAL"].fillna(0) - mat_usage["BILLED_QTY_TOTAL"].fillna(0)
+        mat_usage["HAS_DISCREPANCY"] = mat_usage["QTY_DIFF"] != 0
+
+        discrepancies = mat_usage[mat_usage["HAS_DISCREPANCY"]].sort_values(
+            "QTY_DIFF", ascending=False, key=abs
+        ).reset_index(drop=True)
+
+        with st.container(horizontal=True):
+            st.metric("Total Job-Material Combos", len(mat_usage), border=True)
+            st.metric("With Discrepancies", len(discrepancies), border=True)
+            st.metric(
+                "Discrepancy Rate",
+                f"{len(discrepancies) / max(len(mat_usage), 1) * 100:.1f}%",
+                border=True,
+            )
+
+        if discrepancies.empty:
+            st.success("No quantity discrepancies found between PO and Billing.")
+        else:
+            rename_map = {
+                "JOB_ID_COMBINED": "Job ID",
+                "MATERIAL_ID_COMBINED": "Material ID",
+                "PO_QTY_TOTAL": "PO Qty",
+                "BILLED_QTY_TOTAL": "Billed Qty",
+                "QTY_DIFF": "Qty Difference",
+                "PO_LINES": "Times Used",
+            }
+            if vehicle_col_mat:
+                rename_map[vehicle_col_mat] = "Vehicle"
+
+            st.dataframe(
+                discrepancies.drop(columns=["HAS_DISCREPANCY"]).rename(columns=rename_map),
+                hide_index=True,
+                use_container_width=True,
+            )
