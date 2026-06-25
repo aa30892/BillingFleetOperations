@@ -88,7 +88,7 @@ filtered["QTY_DIFF"] = filtered["PO_QTY"].fillna(0) - filtered["BILLED_QTY"].fil
 tab_dashboard, tab_anomaly = st.tabs(["Dashboard", "AI Anomaly Analysis"])
 
 with tab_dashboard:
-        with st.container(horizontal=True):
+    with st.container(horizontal=True):
         st.metric("Total Records", f"{len(filtered):,}", border=True)
         st.metric(
             "Total Price Diff (PO - Billed) €",
