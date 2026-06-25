@@ -383,3 +383,105 @@ with tab_anomaly:
             st.dataframe(anomaly_display, hide_index=True, use_container_width=True)
         else:
             st.success("No anomalies detected in the current data.")
+
+    st.divider()
+    st.subheader("PO Net Price > Billed Amount — Vendor Severity Flags")
+    st.markdown("Identifies vendors where PO value significantly exceeds what was actually billed per month. "
+                "Large gaps may indicate phantom POs, inflated pricing, or services not rendered.")
+
+    vendor_col_anomaly = None
+    for vc in ["VENDOR_NAME", "VEND_NAME", "VENDOR_NAME_PO", "VEND_NAME_BILL"]:
+        if vc in filtered.columns:
+            vendor_col_anomaly = vc
+            break
+
+    month_col = None
+    for mc in ["PO_POSTING_MONTH", "PO_POSTING_MONTH_PO", "BILLING_MONTH"]:
+        if mc in filtered.columns:
+            month_col = mc
+            break
+
+    if vendor_col_anomaly is None:
+        st.warning("No VENDOR column found. Ensure your CSV includes VENDOR_NAME or VEND_NAME.")
+    elif filtered["NET_PRICE_EURO"].isna().all() and filtered["BILLED_AMT_EURO"].isna().all():
+        st.info("No price data available for this analysis.")
+    else:
+        analysis_df = filtered[[vendor_col_anomaly, "NET_PRICE_EURO", "BILLED_AMT_EURO",
+                                "PO_QTY", "BILLED_QTY", "JOB_ID_COMBINED"]].copy()
+        if month_col and month_col in filtered.columns:
+            analysis_df["MONTH"] = filtered[month_col]
+        else:
+            analysis_df["MONTH"] = filtered["PO_POSTING_DATE_COMBINED"].dt.month
+
+        vendor_monthly = (
+            analysis_df.groupby([vendor_col_anomaly, "MONTH"])
+            .agg(
+                TOTAL_PO_NET_PRICE=("NET_PRICE_EURO", "sum"),
+                TOTAL_BILLED_AMT=("BILLED_AMT_EURO", "sum"),
+                PO_JOBS=("JOB_ID_COMBINED", "count"),
+            )
+            .reset_index()
+        )
+        vendor_monthly["UNDERBILLED_AMT"] = (
+            vendor_monthly["TOTAL_PO_NET_PRICE"].fillna(0) - vendor_monthly["TOTAL_BILLED_AMT"].fillna(0)
+        )
+        vendor_monthly["UNDERBILLED_PCT"] = (
+            vendor_monthly["UNDERBILLED_AMT"] / vendor_monthly["TOTAL_PO_NET_PRICE"].replace(0, np.nan) * 100
+        )
+
+        flagged = vendor_monthly[vendor_monthly["UNDERBILLED_AMT"] > 0].copy()
+
+        def assign_severity(pct):
+            if pct >= 80:
+                return "CRITICAL"
+            elif pct >= 60:
+                return "HIGH"
+            elif pct >= 40:
+                return "MEDIUM"
+            else:
+                return "LOW"
+
+        def assign_flag(row):
+            if row["UNDERBILLED_PCT"] >= 80:
+                return "Extreme gap — vendor may be inflating PO prices or not rendering services"
+            elif row["UNDERBILLED_PCT"] >= 60:
+                return "High underbilling — possible phantom POs or delayed invoicing"
+            elif row["UNDERBILLED_PCT"] >= 40:
+                return "Significant gap — partial services or split billing across periods"
+            else:
+                return "Moderate gap — monitor for trends"
+
+        if flagged.empty:
+            st.success("No underbilling anomalies detected.")
+        else:
+            flagged["SEVERITY"] = flagged["UNDERBILLED_PCT"].apply(assign_severity)
+            flagged["MALPRACTICE_FLAG"] = flagged.apply(assign_flag, axis=1)
+            flagged = flagged.sort_values("UNDERBILLED_AMT", ascending=False).reset_index(drop=True)
+
+            severity_counts = flagged["SEVERITY"].value_counts()
+            with st.container(horizontal=True):
+                st.metric("Critical", severity_counts.get("CRITICAL", 0), border=True)
+                st.metric("High", severity_counts.get("HIGH", 0), border=True)
+                st.metric("Medium", severity_counts.get("MEDIUM", 0), border=True)
+                st.metric("Low", severity_counts.get("LOW", 0), border=True)
+
+            with st.container(border=True):
+                st.markdown("**Top 20 Vendors by Underbilled Amount**")
+                top20 = flagged.head(20).set_index(vendor_col_anomaly)[["TOTAL_PO_NET_PRICE", "TOTAL_BILLED_AMT"]]
+                st.bar_chart(top20)
+
+            st.dataframe(
+                flagged.rename(columns={
+                    vendor_col_anomaly: "Vendor",
+                    "MONTH": "Month",
+                    "TOTAL_PO_NET_PRICE": "PO Net Price €",
+                    "TOTAL_BILLED_AMT": "Billed Amt €",
+                    "UNDERBILLED_AMT": "Underbilled €",
+                    "UNDERBILLED_PCT": "Underbilled %",
+                    "PO_JOBS": "PO Jobs",
+                    "SEVERITY": "Severity",
+                    "MALPRACTICE_FLAG": "Flag",
+                }).round(2),
+                hide_index=True,
+                use_container_width=True,
+            )
