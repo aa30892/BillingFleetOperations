@@ -45,37 +45,40 @@ def load_and_merge(po_bytes, billing_bytes):
 
 merged = load_and_merge(po_file, billing_file)
 
+vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
+
 with st.sidebar:
     st.header("Filters")
-    with st.form("filters_form"):
-        contracts = sorted(merged["CONTRACT_ID_COMBINED"].dropna().unique().tolist())
-        selected_contracts = st.multiselect("Contract ID", contracts)
 
-        all_customers = sorted([x for x in merged["CUSTOMER_NAME_COMBINED"].dropna().unique().tolist() if x.strip() != ""])
-        selected_customers = st.multiselect("Customer Name (type to search)", all_customers)
+    contracts = [x for x in merged["CONTRACT_ID_COMBINED"].unique().tolist() if x != "nan" and x.strip() != ""]
+    contracts.sort()
+    selected_contracts = st.multiselect("Contract ID", contracts, key="filter_contracts")
 
-        vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
-        if vendor_col:
-            vendors = sorted([str(x) for x in merged[vendor_col].dropna().unique().tolist()])
-            selected_vendors = st.multiselect("Vendor Name", vendors)
-        else:
-            selected_vendors = []
+    customers = [x for x in merged["CUSTOMER_NAME_COMBINED"].unique().tolist() if x != "nan" and x.strip() != ""]
+    customers.sort()
+    selected_customers = st.multiselect("Customer Name", customers, key="filter_customers")
 
-        min_date = merged["PO_POSTING_DATE_COMBINED"].min()
-        max_date = merged["PO_POSTING_DATE_COMBINED"].max()
-        if pd.notna(min_date) and pd.notna(max_date):
-            date_range = st.date_input(
-                "PO Posting Date Range",
-                value=(min_date.date(), max_date.date()),
-                min_value=min_date.date(),
-                max_value=max_date.date(),
-            )
-        else:
-            date_range = None
+    if vendor_col:
+        vendors = [str(x) for x in merged[vendor_col].dropna().unique().tolist() if str(x).strip() != ""]
+        vendors.sort()
+        selected_vendors = st.multiselect("Vendor Name", vendors, key="filter_vendors")
+    else:
+        selected_vendors = []
 
-        apply_filters = st.form_submit_button("Apply Filters")
+    min_date = merged["PO_POSTING_DATE_COMBINED"].min()
+    max_date = merged["PO_POSTING_DATE_COMBINED"].max()
+    if pd.notna(min_date) and pd.notna(max_date):
+        date_range = st.date_input(
+            "PO Posting Date Range",
+            value=(min_date.date(), max_date.date()),
+            min_value=min_date.date(),
+            max_value=max_date.date(),
+            key="filter_dates",
+        )
+    else:
+        date_range = None
 
-filtered = merged.copy()
+filtered = merged
 if selected_contracts:
     filtered = filtered[filtered["CONTRACT_ID_COMBINED"].isin(selected_contracts)]
 if selected_customers:
