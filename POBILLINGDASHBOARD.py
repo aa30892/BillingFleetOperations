@@ -44,10 +44,10 @@ merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].fillna(
 with st.sidebar:
     st.header("Filters")
 
-    contracts = sorted(merged["CONTRACT_ID_COMBINED"].dropna().unique().tolist())
+    contracts = sorted(merged["CONTRACT_ID_COMBINED"].dropna().astype(str).unique().tolist())
     selected_contracts = st.multiselect("Contract ID", contracts)
 
-    customers = sorted(merged["CUSTOMER_NAME_COMBINED"].dropna().unique().tolist())
+    customers = sorted(merged["CUSTOMER_NAME_COMBINED"].dropna().astype(str).unique().tolist())
     selected_customers = st.multiselect("Customer Name", customers)
 
     vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
@@ -71,9 +71,9 @@ with st.sidebar:
 
 filtered = merged.copy()
 if selected_contracts:
-    filtered = filtered[filtered["CONTRACT_ID_COMBINED"].isin(selected_contracts)]
+    filtered = filtered[filtered["CONTRACT_ID_COMBINED"].astype(str).isin(selected_contracts)]
 if selected_customers:
-    filtered = filtered[filtered["CUSTOMER_NAME_COMBINED"].isin(selected_customers)]
+    filtered = filtered[filtered["CUSTOMER_NAME_COMBINED"].astype(str).isin(selected_customers)]
 if selected_vendors and vendor_col:
     filtered = filtered[filtered[vendor_col].isin(selected_vendors)]
 if date_range and len(date_range) == 2:
