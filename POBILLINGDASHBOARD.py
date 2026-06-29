@@ -14,68 +14,74 @@ if po_file is None or billing_file is None:
     st.info("Please upload both PO and Billing CSV files to proceed.")
     st.stop()
 
-po_df = pd.read_csv(po_file)
-billing_df = pd.read_csv(billing_file)
 
-po_df.columns = po_df.columns.str.upper()
-billing_df.columns = billing_df.columns.str.upper()
+@st.cache_data
+def load_and_merge(po_bytes, billing_bytes):
+    po_df = pd.read_csv(po_bytes)
+    billing_df = pd.read_csv(billing_bytes)
+    po_df.columns = po_df.columns.str.upper()
+    billing_df.columns = billing_df.columns.str.upper()
+    if "PO_POSTING_DATE" in po_df.columns:
+        po_df["PO_POSTING_DATE"] = pd.to_datetime(po_df["PO_POSTING_DATE"])
+    if "BILLING_DT" in billing_df.columns:
+        billing_df["BILLING_DT"] = pd.to_datetime(billing_df["BILLING_DT"])
+    merged = po_df.merge(
+        billing_df,
+        left_on=["JOB_NOTIFICATION_ID", "MATERIAL_ID"],
+        right_on=["JOB_ID", "MATL_ID_TRIM"],
+        how="outer",
+        suffixes=("_PO", "_BILL"),
+    )
+    merged["CONTRACT_ID_COMBINED"] = merged["FOS_CONTRACT_ID"].combine_first(merged["CONTRACT_ID"]).astype(str)
+    merged["CUSTOMER_NAME_COMBINED"] = merged["CUSTOMER_NAME"].combine_first(merged["CUST_NAME"]).astype(str)
+    merged["MATERIAL_ID_COMBINED"] = merged["MATERIAL_ID"].combine_first(merged["MATL_ID_TRIM"]).astype(str)
+    merged["JOB_ID_COMBINED"] = merged["JOB_NOTIFICATION_ID"].combine_first(merged["JOB_ID"]).astype(str)
+    if "BILLING_DT" in merged.columns:
+        merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].combine_first(merged["BILLING_DT"])
+    else:
+        merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"]
+    return merged
 
-if "PO_POSTING_DATE" in po_df.columns:
-    po_df["PO_POSTING_DATE"] = pd.to_datetime(po_df["PO_POSTING_DATE"])
-if "BILLING_DT" in billing_df.columns:
-    billing_df["BILLING_DT"] = pd.to_datetime(billing_df["BILLING_DT"])
 
-merged = po_df.merge(
-    billing_df,
-    left_on=["JOB_NOTIFICATION_ID", "MATERIAL_ID"],
-    right_on=["JOB_ID", "MATL_ID_TRIM"],
-    how="outer",
-    suffixes=("_PO", "_BILL"),
-)
-
-merged["CONTRACT_ID_COMBINED"] = merged["FOS_CONTRACT_ID"].fillna(merged["CONTRACT_ID"])
-merged["CUSTOMER_NAME_COMBINED"] = merged["CUSTOMER_NAME"].combine_first(merged["CUST_NAME"])
-merged["MATERIAL_ID_COMBINED"] = merged["MATERIAL_ID"].fillna(merged["MATL_ID_TRIM"])
-merged["JOB_ID_COMBINED"] = merged["JOB_NOTIFICATION_ID"].fillna(merged["JOB_ID"])
-merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].fillna(
-    merged["BILLING_DT"] if "BILLING_DT" in merged.columns else pd.NaT
-)
+merged = load_and_merge(po_file, billing_file)
 
 with st.sidebar:
     st.header("Filters")
+    with st.form("filters_form"):
+        contracts = sorted(merged["CONTRACT_ID_COMBINED"].dropna().unique().tolist())
+        selected_contracts = st.multiselect("Contract ID", contracts)
 
-    contracts = sorted(merged["CONTRACT_ID_COMBINED"].dropna().astype(str).unique().tolist())
-    selected_contracts = st.multiselect("Contract ID", contracts)
+        all_customers = sorted([x for x in merged["CUSTOMER_NAME_COMBINED"].dropna().unique().tolist() if x.strip() != ""])
+        selected_customers = st.multiselect("Customer Name (type to search)", all_customers)
 
-    all_customers = sorted([str(x) for x in merged["CUSTOMER_NAME_COMBINED"].dropna().unique().tolist() if str(x).strip() != ""])
-    selected_customers = st.multiselect("Customer Name (type to search)", all_customers)
+        vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
+        if vendor_col:
+            vendors = sorted([str(x) for x in merged[vendor_col].dropna().unique().tolist()])
+            selected_vendors = st.multiselect("Vendor Name", vendors)
+        else:
+            selected_vendors = []
 
-    vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
-    if vendor_col:
-        vendors = sorted(merged[vendor_col].dropna().unique().tolist())
-        selected_vendors = st.multiselect("Vendor Name", vendors)
-    else:
-        selected_vendors = []
+        min_date = merged["PO_POSTING_DATE_COMBINED"].min()
+        max_date = merged["PO_POSTING_DATE_COMBINED"].max()
+        if pd.notna(min_date) and pd.notna(max_date):
+            date_range = st.date_input(
+                "PO Posting Date Range",
+                value=(min_date.date(), max_date.date()),
+                min_value=min_date.date(),
+                max_value=max_date.date(),
+            )
+        else:
+            date_range = None
 
-    min_date = merged["PO_POSTING_DATE_COMBINED"].min()
-    max_date = merged["PO_POSTING_DATE_COMBINED"].max()
-    if pd.notna(min_date) and pd.notna(max_date):
-        date_range = st.date_input(
-            "PO Posting Date Range",
-            value=(min_date.date(), max_date.date()),
-            min_value=min_date.date(),
-            max_value=max_date.date(),
-        )
-    else:
-        date_range = None
+        apply_filters = st.form_submit_button("Apply Filters")
 
 filtered = merged.copy()
 if selected_contracts:
-    filtered = filtered[filtered["CONTRACT_ID_COMBINED"].astype(str).isin(selected_contracts)]
+    filtered = filtered[filtered["CONTRACT_ID_COMBINED"].isin(selected_contracts)]
 if selected_customers:
-    filtered = filtered[filtered["CUSTOMER_NAME_COMBINED"].astype(str).isin(selected_customers)]
+    filtered = filtered[filtered["CUSTOMER_NAME_COMBINED"].isin(selected_customers)]
 if selected_vendors and vendor_col:
-    filtered = filtered[filtered[vendor_col].isin(selected_vendors)]
+    filtered = filtered[filtered[vendor_col].astype(str).isin(selected_vendors)]
 if date_range and len(date_range) == 2:
     filtered = filtered[
         (filtered["PO_POSTING_DATE_COMBINED"] >= pd.Timestamp(date_range[0]))
