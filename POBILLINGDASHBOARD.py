@@ -396,92 +396,199 @@ with tab_repair:
         )
 
 with tab_anomaly:
-    st.subheader("AI Anomaly Detection")
-    st.markdown("Identifies outliers in price and quantity differences using statistical analysis (IQR method).")
+    st.subheader("AI Anomaly Detection — Vendor Behaviour vs Material")
+    st.markdown("Analyses vendor billing patterns per material description, flagging suspicious behaviour using IQR-based outlier detection.")
 
     if filtered.empty:
         st.warning("No data available. Adjust filters to see anomaly analysis.")
     else:
-        def detect_anomalies(df, column, label):
+        vendor_col_anom = None
+        for vc in ["VENDOR_NAME", "VEND_NAME", "VENDOR_NAME_PO", "VEND_NAME_BILL"]:
+            if vc in filtered.columns:
+                vendor_col_anom = vc
+                break
+
+        mat_desc_anom = None
+        for mc in ["MATERIAL_DESC", "MATERIAL_DESC_PO", "MATL_DESC", "MATL_DESC_PO", "MATL_DESC_BILL"]:
+            if mc in filtered.columns:
+                mat_desc_anom = mc
+                break
+
+        filtered["PRICE_DIFF"] = filtered["NET_PRICE_EURO"].fillna(0) - filtered["BILLED_AMT_EURO"].fillna(0)
+        filtered["QTY_DIFF"] = filtered["PO_QTY"].fillna(0) - filtered["BILLED_QTY"].fillna(0)
+
+        def detect_anomalies(df, column):
             data = df[column].dropna()
-            if data.empty:
+            if data.empty or data.std() == 0:
                 return pd.DataFrame()
             q1 = data.quantile(0.25)
             q3 = data.quantile(0.75)
             iqr = q3 - q1
             lower = q1 - 1.5 * iqr
             upper = q3 + 1.5 * iqr
-            anomalies = df[(df[column] < lower) | (df[column] > upper)].copy()
-            anomalies["ANOMALY_TYPE"] = label
-            anomalies["ANOMALY_VALUE"] = anomalies[column]
-            anomalies["LOWER_BOUND"] = lower
-            anomalies["UPPER_BOUND"] = upper
-            return anomalies
+            return df[(df[column] < lower) | (df[column] > upper)]
 
-        price_anomalies = detect_anomalies(filtered, "PRICE_DIFF", "Price Difference")
-        qty_anomalies = detect_anomalies(filtered, "QTY_DIFF", "Quantity Difference")
-        all_anomalies = pd.concat([price_anomalies, qty_anomalies], ignore_index=True)
+        price_outliers = detect_anomalies(filtered, "PRICE_DIFF")
+        qty_outliers = detect_anomalies(filtered, "QTY_DIFF")
 
+        total_anomalies = len(price_outliers) + len(qty_outliers)
         with st.container(horizontal=True):
-            st.metric("Price Anomalies", len(price_anomalies), border=True)
-            st.metric("Quantity Anomalies", len(qty_anomalies), border=True)
+            st.metric("Price Outliers", f"{len(price_outliers):,}", border=True)
+            st.metric("Qty Outliers", f"{len(qty_outliers):,}", border=True)
+            st.metric("Total Anomalies", f"{total_anomalies:,}", border=True)
             st.metric(
                 "Anomaly Rate",
-                f"{(len(all_anomalies) / (2 * len(filtered)) * 100):.1f}%" if len(filtered) > 0 else "0%",
+                f"{total_anomalies / max(2 * len(filtered), 1) * 100:.1f}%",
                 border=True,
             )
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            with st.container(border=True):
-                st.markdown("**Price Diff Distribution**")
-                price_data = filtered["PRICE_DIFF"].dropna()
-                if not price_data.empty:
-                    hist_values = np.histogram(price_data, bins=30)[0]
-                    st.bar_chart(hist_values)
-                    if not price_anomalies.empty:
-                        q1 = price_data.quantile(0.25)
-                        q3 = price_data.quantile(0.75)
-                        iqr = q3 - q1
-                        st.caption(f"Bounds: [{q1 - 1.5*iqr:,.2f}, {q3 + 1.5*iqr:,.2f}]")
+        st.divider()
+        st.subheader("Vendor Anomaly Heatmap")
+        st.markdown("Shows which vendors have the most anomalous transactions by material — higher counts indicate suspicious patterns.")
 
-        with col_b:
-            with st.container(border=True):
-                st.markdown("**Qty Diff Distribution**")
-                qty_data = filtered["QTY_DIFF"].dropna()
-                if not qty_data.empty:
-                    hist_values = np.histogram(qty_data, bins=30)[0]
-                    st.bar_chart(hist_values)
-                    if not qty_anomalies.empty:
-                        q1 = qty_data.quantile(0.25)
-                        q3 = qty_data.quantile(0.75)
-                        iqr = q3 - q1
-                        st.caption(f"Bounds: [{q1 - 1.5*iqr:,.2f}, {q3 + 1.5*iqr:,.2f}]")
+        if vendor_col_anom and mat_desc_anom:
+            combined_outliers = pd.concat([price_outliers, qty_outliers]).drop_duplicates(subset=["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"])
 
-        if not all_anomalies.empty:
-            st.subheader("Flagged Anomalies")
-            anomaly_display = all_anomalies[[
-                "JOB_ID_COMBINED",
-                "MATERIAL_ID_COMBINED",
-                "CONTRACT_ID_COMBINED",
-                "CUSTOMER_NAME_COMBINED",
-                "ANOMALY_TYPE",
-                "ANOMALY_VALUE",
-                "LOWER_BOUND",
-                "UPPER_BOUND",
-            ]].rename(columns={
-                "JOB_ID_COMBINED": "Job ID",
-                "MATERIAL_ID_COMBINED": "Material ID",
-                "CONTRACT_ID_COMBINED": "Contract ID",
-                "CUSTOMER_NAME_COMBINED": "Customer",
-                "ANOMALY_TYPE": "Type",
-                "ANOMALY_VALUE": "Value",
-                "LOWER_BOUND": "Lower Bound",
-                "UPPER_BOUND": "Upper Bound",
-            })
-            st.dataframe(anomaly_display, hide_index=True, use_container_width=True)
-        else:
-            st.success("No anomalies detected in the current data.")
+            if not combined_outliers.empty:
+                vendor_mat_counts = (
+                    combined_outliers.groupby([vendor_col_anom, mat_desc_anom])
+                    .size()
+                    .reset_index(name="ANOMALY_COUNT")
+                    .sort_values("ANOMALY_COUNT", ascending=False)
+                )
+
+                top_vendors = vendor_mat_counts[vendor_col_anom].value_counts().head(15).index.tolist()
+                top_materials = vendor_mat_counts[mat_desc_anom].value_counts().head(10).index.tolist()
+
+                heatmap_data = vendor_mat_counts[
+                    (vendor_mat_counts[vendor_col_anom].isin(top_vendors)) &
+                    (vendor_mat_counts[mat_desc_anom].isin(top_materials))
+                ]
+
+                if not heatmap_data.empty:
+                    pivot_heat = heatmap_data.pivot_table(
+                        index=vendor_col_anom, columns=mat_desc_anom, values="ANOMALY_COUNT", fill_value=0
+                    )
+                    st.dataframe(
+                        pivot_heat.style.background_gradient(cmap="Reds", axis=None),
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("Not enough data for heatmap.")
+
+                st.divider()
+                st.subheader("Top Offending Vendors")
+
+                vendor_scores = (
+                    combined_outliers.groupby(vendor_col_anom)
+                    .agg(
+                        ANOMALY_COUNT=("JOB_ID_COMBINED", "count"),
+                        TOTAL_PRICE_DIFF=("PRICE_DIFF", "sum"),
+                        AVG_PRICE_DIFF=("PRICE_DIFF", "mean"),
+                        TOTAL_QTY_DIFF=("QTY_DIFF", "sum"),
+                        UNIQUE_MATERIALS=("MATERIAL_ID_COMBINED", "nunique"),
+                    )
+                    .reset_index()
+                    .sort_values("ANOMALY_COUNT", ascending=False)
+                    .head(20)
+                    .reset_index(drop=True)
+                )
+                vendor_scores.index = vendor_scores.index + 1
+                vendor_scores.index.name = "Rank"
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    with st.container(border=True):
+                        st.markdown("**Anomaly Count by Vendor (Top 20)**")
+                        st.bar_chart(vendor_scores.set_index(vendor_col_anom)["ANOMALY_COUNT"])
+                with col2:
+                    with st.container(border=True):
+                        st.markdown("**Total Price Difference by Vendor (Top 20)**")
+                        st.bar_chart(vendor_scores.set_index(vendor_col_anom)["TOTAL_PRICE_DIFF"])
+
+                st.dataframe(
+                    vendor_scores.rename(columns={
+                        vendor_col_anom: "Vendor",
+                        "ANOMALY_COUNT": "Anomalies",
+                        "TOTAL_PRICE_DIFF": "Total Price Diff €",
+                        "AVG_PRICE_DIFF": "Avg Price Diff €",
+                        "TOTAL_QTY_DIFF": "Total Qty Diff",
+                        "UNIQUE_MATERIALS": "Unique Materials",
+                    }).round(2),
+                    use_container_width=True,
+                )
+
+                st.divider()
+                st.subheader("Material-Level Anomaly Breakdown")
+                st.markdown("Which materials are most commonly involved in anomalous vendor behaviour?")
+
+                mat_scores = (
+                    combined_outliers.groupby([mat_desc_anom, "MATERIAL_ID_COMBINED"])
+                    .agg(
+                        ANOMALY_COUNT=("JOB_ID_COMBINED", "count"),
+                        VENDORS_INVOLVED=(vendor_col_anom, "nunique"),
+                        TOTAL_PRICE_DIFF=("PRICE_DIFF", "sum"),
+                        TOTAL_QTY_DIFF=("QTY_DIFF", "sum"),
+                    )
+                    .reset_index()
+                    .sort_values("ANOMALY_COUNT", ascending=False)
+                    .head(25)
+                    .reset_index(drop=True)
+                )
+
+                with st.container(border=True):
+                    st.markdown("**Top 25 Materials by Anomaly Frequency**")
+                    st.bar_chart(mat_scores.set_index(mat_desc_anom)["ANOMALY_COUNT"].head(15))
+
+                st.dataframe(
+                    mat_scores.rename(columns={
+                        mat_desc_anom: "Material Description",
+                        "MATERIAL_ID_COMBINED": "Material ID",
+                        "ANOMALY_COUNT": "Anomalies",
+                        "VENDORS_INVOLVED": "Vendors Involved",
+                        "TOTAL_PRICE_DIFF": "Total Price Diff €",
+                        "TOTAL_QTY_DIFF": "Total Qty Diff",
+                    }).round(2),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                st.divider()
+                st.subheader("Vendor × Material Detail — Anomalous Records")
+
+                detail_cols = ["JOB_ID_COMBINED", vendor_col_anom, "MATERIAL_ID_COMBINED"]
+                if mat_desc_anom:
+                    detail_cols.append(mat_desc_anom)
+                detail_cols.extend(["NET_PRICE_EURO", "BILLED_AMT_EURO", "PRICE_DIFF", "PO_QTY", "BILLED_QTY", "QTY_DIFF"])
+
+                available_detail = [c for c in detail_cols if c in combined_outliers.columns]
+                detail_df = combined_outliers[available_detail].sort_values("PRICE_DIFF", ascending=False, key=abs)
+
+                rename_detail = {
+                    "JOB_ID_COMBINED": "Job ID",
+                    vendor_col_anom: "Vendor",
+                    "MATERIAL_ID_COMBINED": "Material ID",
+                    "NET_PRICE_EURO": "PO Net Price €",
+                    "BILLED_AMT_EURO": "Billed Amt €",
+                    "PRICE_DIFF": "Price Diff €",
+                    "PO_QTY": "PO Qty",
+                    "BILLED_QTY": "Billed Qty",
+                    "QTY_DIFF": "Qty Diff",
+                }
+                if mat_desc_anom:
+                    rename_detail[mat_desc_anom] = "Material Desc"
+
+                st.dataframe(
+                    detail_df.rename(columns=rename_detail).round(2),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            else:
+                st.success("No anomalies detected in the current data.")
+        elif vendor_col_anom is None:
+            st.warning("No VENDOR column found. Ensure your CSV includes VENDOR_NAME or VEND_NAME.")
+        elif mat_desc_anom is None:
+            st.warning("No MATERIAL_DESC column found. Ensure your CSV includes MATERIAL_DESC or MATL_DESC.")
 
     st.divider()
     st.subheader("PO Net Price > Billed Amount — Vendor Severity Flags")
