@@ -496,6 +496,12 @@ with tab_anomaly:
     st.subheader("Material Usage per Job & Vehicle — PO vs Billing Discrepancies")
     st.markdown("Shows per Job ID which Material IDs and how many times they were used on a vehicle, "
                 "highlighting where PO quantity differs from Billing quantity.")
+    st.markdown("""
+- **PO Qty**: Total units ordered (sum of PO_QTY across all line items for that Job + Material + Vehicle)
+- **Times Used**: Number of separate PO line entries for that combination
+- **Billed Qty**: Total units actually invoiced
+- **Qty Difference**: PO Qty minus Billed Qty — positive means more was ordered than billed
+""")
 
     vehicle_col_mat = None
     for vc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID"]:
@@ -503,11 +509,19 @@ with tab_anomaly:
             vehicle_col_mat = vc
             break
 
+    mat_desc_col = None
+    for mc in ["MATERIAL_DESC", "MATERIAL_DESC_PO", "MATL_DESC", "MATL_DESC_PO", "MATL_DESC_BILL"]:
+        if mc in filtered.columns:
+            mat_desc_col = mc
+            break
+
     required_cols = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED", "PO_QTY", "BILLED_QTY"]
     if not all(c in filtered.columns for c in required_cols):
         st.warning("Missing required columns (JOB_ID, MATERIAL_ID, PO_QTY, or BILLED_QTY).")
     else:
         group_cols = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]
+        if mat_desc_col:
+            group_cols.append(mat_desc_col)
         if vehicle_col_mat:
             group_cols.append(vehicle_col_mat)
 
@@ -547,6 +561,8 @@ with tab_anomaly:
                 "QTY_DIFF": "Qty Difference",
                 "PO_LINES": "Times Used",
             }
+            if mat_desc_col:
+                rename_map[mat_desc_col] = "Material Description"
             if vehicle_col_mat:
                 rename_map[vehicle_col_mat] = "Vehicle"
 
