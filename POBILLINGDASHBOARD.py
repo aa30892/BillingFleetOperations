@@ -34,7 +34,7 @@ merged = po_df.merge(
 )
 
 merged["CONTRACT_ID_COMBINED"] = merged["FOS_CONTRACT_ID"].fillna(merged["CONTRACT_ID"])
-merged["CUSTOMER_NAME_COMBINED"] = merged["CUSTOMER_NAME"].fillna(merged["CUST_NAME"])
+merged["CUSTOMER_NAME_COMBINED"] = merged["CUSTOMER_NAME"].combine_first(merged["CUST_NAME"])
 merged["MATERIAL_ID_COMBINED"] = merged["MATERIAL_ID"].fillna(merged["MATL_ID_TRIM"])
 merged["JOB_ID_COMBINED"] = merged["JOB_NOTIFICATION_ID"].fillna(merged["JOB_ID"])
 merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].fillna(
@@ -47,7 +47,7 @@ with st.sidebar:
     contracts = sorted(merged["CONTRACT_ID_COMBINED"].dropna().astype(str).unique().tolist())
     selected_contracts = st.multiselect("Contract ID", contracts)
 
-    customers = sorted(merged["CUSTOMER_NAME_COMBINED"].dropna().astype(str).unique().tolist())
+    customers = sorted([x for x in merged["CUSTOMER_NAME_COMBINED"].dropna().unique().tolist() if str(x).strip() != ""])
     selected_customers = st.multiselect("Customer Name", customers)
 
     vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
@@ -73,7 +73,7 @@ filtered = merged.copy()
 if selected_contracts:
     filtered = filtered[filtered["CONTRACT_ID_COMBINED"].astype(str).isin(selected_contracts)]
 if selected_customers:
-    filtered = filtered[filtered["CUSTOMER_NAME_COMBINED"].astype(str).isin(selected_customers)]
+    filtered = filtered[filtered["CUSTOMER_NAME_COMBINED"].isin(selected_customers)]
 if selected_vendors and vendor_col:
     filtered = filtered[filtered[vendor_col].isin(selected_vendors)]
 if date_range and len(date_range) == 2:
