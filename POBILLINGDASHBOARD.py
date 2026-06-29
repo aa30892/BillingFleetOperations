@@ -48,12 +48,7 @@ with st.sidebar:
     selected_contracts = st.multiselect("Contract ID", contracts)
 
     all_customers = sorted([str(x) for x in merged["CUSTOMER_NAME_COMBINED"].dropna().unique().tolist() if str(x).strip() != ""])
-    customer_search = st.text_input("Search Customer Name")
-    if customer_search:
-        filtered_customers = [c for c in all_customers if customer_search.lower() in c.lower()]
-    else:
-        filtered_customers = all_customers
-    selected_customers = st.multiselect("Customer Name", filtered_customers)
+    selected_customers = st.multiselect("Customer Name (type to search)", all_customers)
 
     vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
     if vendor_col:
@@ -90,7 +85,7 @@ if date_range and len(date_range) == 2:
 filtered["PRICE_DIFF"] = filtered["NET_PRICE_EURO"].fillna(0) - filtered["BILLED_AMT_EURO"].fillna(0)
 filtered["QTY_DIFF"] = filtered["PO_QTY"].fillna(0) - filtered["BILLED_QTY"].fillna(0)
 
-tab_dashboard, tab_repair, tab_anomaly = st.tabs(["Dashboard", "Repair Materials Ranking", "AI Anomaly Analysis"])
+tab_dashboard, tab_repair, tab_anomaly = st.tabs(["Dashboard", "Contract Analysis", "AI Anomaly Analysis"])
 
 with tab_dashboard:
     with st.container(horizontal=True):
@@ -300,6 +295,96 @@ with tab_repair:
                         hide_index=True,
                         use_container_width=True,
                     )
+
+    st.divider()
+    st.subheader("Fleet Type Analysis — Materials per Job & Vehicle")
+    st.markdown("Breaks down by `FLEET_TYPE` which materials are used per job and vehicle, with quantities and descriptions.")
+
+    fleet_col = None
+    for fc in ["FLEET_TYPE", "FLEET_TYPE_PO"]:
+        if fc in filtered.columns:
+            fleet_col = fc
+            break
+
+    vehicle_col_fleet = None
+    for vc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID"]:
+        if vc in filtered.columns:
+            vehicle_col_fleet = vc
+            break
+
+    mat_desc_fleet = None
+    for mc in ["MATERIAL_DESC", "MATERIAL_DESC_PO", "MATL_DESC", "MATL_DESC_PO", "MATL_DESC_BILL"]:
+        if mc in filtered.columns:
+            mat_desc_fleet = mc
+            break
+
+    if fleet_col is None:
+        st.warning("No FLEET_TYPE column found. Ensure your PO CSV includes FLEET_TYPE.")
+    elif vehicle_col_fleet is None:
+        st.warning("No VEHICLE column found. Ensure your CSV includes VEHICLE_ID or LICENCE_PLATE.")
+    else:
+        fleet_types = sorted([str(x) for x in filtered[fleet_col].dropna().unique().tolist() if str(x).strip() != ""])
+        selected_fleet = st.multiselect("Filter by Fleet Type", fleet_types, key="fleet_filter")
+
+        fleet_df = filtered.copy()
+        if selected_fleet:
+            fleet_df = fleet_df[fleet_df[fleet_col].astype(str).isin(selected_fleet)]
+
+        group_cols_fleet = ["JOB_ID_COMBINED", vehicle_col_fleet, "MATERIAL_ID_COMBINED"]
+        if mat_desc_fleet:
+            group_cols_fleet.append(mat_desc_fleet)
+        group_cols_fleet.append(fleet_col)
+
+        fleet_analysis = (
+            fleet_df.groupby(group_cols_fleet)
+            .agg(
+                PO_QTY=("PO_QTY", "sum"),
+                BILLED_QTY=("BILLED_QTY", "sum"),
+                OCCURRENCES=("JOB_ID_COMBINED", "count"),
+            )
+            .reset_index()
+        )
+        fleet_analysis["QTY_DIFF"] = fleet_analysis["PO_QTY"].fillna(0) - fleet_analysis["BILLED_QTY"].fillna(0)
+        fleet_analysis = fleet_analysis.sort_values(["PO_QTY"], ascending=False).reset_index(drop=True)
+
+        with st.container(horizontal=True):
+            st.metric("Fleet Types", len(fleet_types), border=True)
+            st.metric("Records", len(fleet_analysis), border=True)
+            st.metric("Unique Vehicles", fleet_df[vehicle_col_fleet].nunique(), border=True)
+
+        with st.container(border=True):
+            st.markdown("**Material Usage by Fleet Type**")
+            fleet_summary = (
+                fleet_df.groupby([fleet_col, "MATERIAL_ID_COMBINED"])
+                .agg(TOTAL_QTY=("PO_QTY", "sum"))
+                .reset_index()
+                .sort_values("TOTAL_QTY", ascending=False)
+            )
+            top_by_fleet = fleet_summary.groupby(fleet_col).head(10)
+            if not top_by_fleet.empty:
+                pivot = top_by_fleet.pivot_table(
+                    index="MATERIAL_ID_COMBINED", columns=fleet_col, values="TOTAL_QTY", fill_value=0
+                )
+                st.bar_chart(pivot)
+
+        rename_map_fleet = {
+            "JOB_ID_COMBINED": "Job ID",
+            vehicle_col_fleet: "Vehicle",
+            "MATERIAL_ID_COMBINED": "Material ID",
+            fleet_col: "Fleet Type",
+            "PO_QTY": "PO Qty",
+            "BILLED_QTY": "Billed Qty",
+            "QTY_DIFF": "Qty Diff",
+            "OCCURRENCES": "Times Used",
+        }
+        if mat_desc_fleet:
+            rename_map_fleet[mat_desc_fleet] = "Material Description"
+
+        st.dataframe(
+            fleet_analysis.rename(columns=rename_map_fleet),
+            hide_index=True,
+            use_container_width=True,
+        )
 
 with tab_anomaly:
     st.subheader("AI Anomaly Detection")
