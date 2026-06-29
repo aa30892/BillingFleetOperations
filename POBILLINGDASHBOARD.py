@@ -470,7 +470,7 @@ with tab_anomaly:
                         index=vendor_col_anom, columns=mat_desc_anom, values="ANOMALY_COUNT", fill_value=0
                     )
                     st.dataframe(
-                        pivot_heat.style.background_gradient(cmap="Reds", axis=None),
+                        pivot_heat,
                         use_container_width=True,
                     )
                 else:
