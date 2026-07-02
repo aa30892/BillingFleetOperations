@@ -1,6 +1,9 @@
+# PO vs Billing dashboard with customer grouping filter
+# Co-authored with CoCo
 import streamlit as st
 import pandas as pd
 import numpy as np
+from collections import defaultdict
 
 st.set_page_config(page_title="PO vs Billing Dashboard", layout="wide")
 st.title("PO vs Billing Comparison")
@@ -32,10 +35,10 @@ def load_and_merge(po_bytes, billing_bytes):
         how="outer",
         suffixes=("_PO", "_BILL"),
     )
-    merged["CONTRACT_ID_COMBINED"] = merged["FOS_CONTRACT_ID"].combine_first(merged["CONTRACT_ID"]).astype(str)
+    merged["CONTRACT_ID_COMBINED"] = merged["FOS_CONTRACT_ID"].combine_first(merged["CONTRACT_ID"]).astype(str).str.replace(r'\.\d+$', '', regex=True)
     merged["CUSTOMER_NAME_COMBINED"] = merged["CUSTOMER_NAME"].combine_first(merged["CUST_NAME"]).astype(str)
-    merged["MATERIAL_ID_COMBINED"] = merged["MATERIAL_ID"].combine_first(merged["MATL_ID_TRIM"]).astype(str)
-    merged["JOB_ID_COMBINED"] = merged["JOB_NOTIFICATION_ID"].combine_first(merged["JOB_ID"]).astype(str)
+    merged["MATERIAL_ID_COMBINED"] = merged["MATERIAL_ID"].combine_first(merged["MATL_ID_TRIM"]).astype(str).str.replace(r'\.\d+$', '', regex=True)
+    merged["JOB_ID_COMBINED"] = merged["JOB_NOTIFICATION_ID"].combine_first(merged["JOB_ID"]).astype(str).str.replace(r'\.\d+$', '', regex=True)
     if "BILLING_DT" in merged.columns:
         merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].combine_first(merged["BILLING_DT"])
     else:
@@ -47,12 +50,47 @@ merged = load_and_merge(po_file, billing_file)
 
 vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
 
+
+def build_customer_groups(customer_names):
+    """Group customers by common keyword prefix (first word of the name).
+    If multiple customers share the same first word, they are grouped under that word."""
+    prefix_map = defaultdict(list)
+    for name in customer_names:
+        parts = name.strip().split()
+        if parts:
+            prefix = parts[0].upper()
+            prefix_map[prefix].append(name)
+    groups = {}
+    for prefix, members in prefix_map.items():
+        if len(members) > 1:
+            group_label = prefix.title()
+            for m in members:
+                groups[m] = group_label
+        else:
+            groups[members[0]] = members[0]
+    return groups
+
+
+all_customers = [x for x in merged["CUSTOMER_NAME_COMBINED"].unique().tolist() if x != "nan" and x.strip() != ""]
+all_customers.sort()
+customer_group_map = build_customer_groups(all_customers)
+merged["CUSTOMER_GROUP"] = merged["CUSTOMER_NAME_COMBINED"].map(customer_group_map).fillna(merged["CUSTOMER_NAME_COMBINED"])
+
 with st.sidebar:
     st.header("Filters")
 
     contracts = [x for x in merged["CONTRACT_ID_COMBINED"].unique().tolist() if x != "nan" and x.strip() != ""]
     contracts.sort()
     selected_contracts = st.multiselect("Contract ID", contracts, key="filter_contracts")
+
+    customer_groups = sorted(merged["CUSTOMER_GROUP"].dropna().unique().tolist())
+    customer_groups = [x for x in customer_groups if x != "nan" and x.strip() != ""]
+    selected_customer_groups = st.multiselect(
+        "Customer Group",
+        customer_groups,
+        help="Customers are grouped by shared first keyword (e.g. all 'Transdev ...' entries → 'Transdev')",
+        key="filter_customer_groups",
+    )
 
     customers = [x for x in merged["CUSTOMER_NAME_COMBINED"].unique().tolist() if x != "nan" and x.strip() != ""]
     customers.sort()
@@ -64,6 +102,10 @@ with st.sidebar:
         selected_vendors = st.multiselect("Vendor Name", vendors, key="filter_vendors")
     else:
         selected_vendors = []
+
+    job_ids = [str(x) for x in merged["JOB_ID_COMBINED"].unique().tolist() if str(x) != "nan" and str(x).strip() != ""]
+    job_ids.sort()
+    selected_job_ids = st.multiselect("Job ID", job_ids, key="filter_job_ids")
 
     min_date = merged["PO_POSTING_DATE_COMBINED"].min()
     max_date = merged["PO_POSTING_DATE_COMBINED"].max()
@@ -81,10 +123,14 @@ with st.sidebar:
 filtered = merged
 if selected_contracts:
     filtered = filtered[filtered["CONTRACT_ID_COMBINED"].isin(selected_contracts)]
+if selected_customer_groups:
+    filtered = filtered[filtered["CUSTOMER_GROUP"].isin(selected_customer_groups)]
 if selected_customers:
     filtered = filtered[filtered["CUSTOMER_NAME_COMBINED"].isin(selected_customers)]
 if selected_vendors and vendor_col:
     filtered = filtered[filtered[vendor_col].astype(str).isin(selected_vendors)]
+if selected_job_ids:
+    filtered = filtered[filtered["JOB_ID_COMBINED"].astype(str).isin(selected_job_ids)]
 if date_range and len(date_range) == 2:
     filtered = filtered[
         (filtered["PO_POSTING_DATE_COMBINED"] >= pd.Timestamp(date_range[0]))
