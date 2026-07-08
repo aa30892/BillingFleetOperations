@@ -463,15 +463,22 @@ with tab_repair:
     if "CUSTOMER_GROUP" not in filtered.columns:
         st.warning("No CUSTOMER_GROUP column found in the data.")
     else:
-        cg_po = filtered[filtered["PO_QTY"].notna()].groupby("CUSTOMER_GROUP").agg(
-            TIMES_USED_PO=("PO_QTY", "count"),
-            **{"TOTAL_PO_EURO": ("NET_PRICE_EURO", "sum")} if "NET_PRICE_EURO" in filtered.columns else {},
-        ).reset_index()
+        po_cg_dedup = ["CUSTOMER_GROUP"] + [c for c in ["PO_QTY", "NET_PRICE_EURO"] if c in filtered.columns]
+        bill_cg_dedup = ["CUSTOMER_GROUP"] + [c for c in ["BILLED_QTY", "BILLED_AMT_EURO"] if c in filtered.columns]
 
-        cg_bill = filtered[filtered["BILLED_QTY"].notna()].groupby("CUSTOMER_GROUP").agg(
-            TIMES_BILLED=("BILLED_QTY", "count"),
-            **{"TOTAL_BILLED_EURO": ("BILLED_AMT_EURO", "sum")} if "BILLED_AMT_EURO" in filtered.columns else {},
-        ).reset_index()
+        po_cg_data = filtered[filtered["PO_QTY"].notna()].drop_duplicates(subset=po_cg_dedup)
+        bill_cg_data = filtered[filtered["BILLED_QTY"].notna()].drop_duplicates(subset=bill_cg_dedup)
+
+        po_cg_agg = {"TIMES_USED_PO": ("PO_QTY", "count")}
+        if "NET_PRICE_EURO" in po_cg_data.columns:
+            po_cg_agg["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
+
+        bill_cg_agg = {"TIMES_BILLED": ("BILLED_QTY", "count")}
+        if "BILLED_AMT_EURO" in bill_cg_data.columns:
+            bill_cg_agg["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
+
+        cg_po = po_cg_data.groupby("CUSTOMER_GROUP").agg(**po_cg_agg).reset_index()
+        cg_bill = bill_cg_data.groupby("CUSTOMER_GROUP").agg(**bill_cg_agg).reset_index()
 
         cg_analysis = cg_po.merge(cg_bill, on="CUSTOMER_GROUP", how="outer")
         cg_analysis["TIMES_USED_PO"] = cg_analysis["TIMES_USED_PO"].fillna(0).astype(int)
@@ -550,8 +557,11 @@ with tab_repair:
                 if mat_desc_cg:
                     group_cols_cg.append(mat_desc_cg)
 
-                po_side = cg_filtered[cg_filtered["PO_QTY"].notna()]
-                bill_side = cg_filtered[cg_filtered["BILLED_QTY"].notna()]
+                po_dedup = [c for c in group_cols_cg if c in cg_filtered.columns] + [c for c in ["PO_QTY", "NET_PRICE_EURO"] if c in cg_filtered.columns]
+                bill_dedup = [c for c in group_cols_cg if c in cg_filtered.columns] + [c for c in ["BILLED_QTY", "BILLED_AMT_EURO"] if c in cg_filtered.columns]
+
+                po_side = cg_filtered[cg_filtered["PO_QTY"].notna()].drop_duplicates(subset=po_dedup)
+                bill_side = cg_filtered[cg_filtered["BILLED_QTY"].notna()].drop_duplicates(subset=bill_dedup)
 
                 po_agg_dict = {"TIMES_USED_PO": ("PO_QTY", "count")}
                 if "NET_PRICE_EURO" in po_side.columns:
