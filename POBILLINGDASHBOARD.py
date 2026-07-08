@@ -389,23 +389,23 @@ with tab_repair:
         group_cols_fleet.append(fleet_col)
 
         # Aggregate PO and Billing sides separately to avoid many-to-many inflation
-        po_cols = [c for c in group_cols_fleet if c in fleet_df.columns]
-        po_agg = fleet_df[fleet_df["PO_QTY"].notna()].drop_duplicates(
-            subset=po_cols + ["NET_PRICE_EURO"] if "NET_PRICE_EURO" in fleet_df.columns else po_cols
-        )
-        bill_agg = fleet_df[fleet_df["BILLED_QTY"].notna()].drop_duplicates(
-            subset=po_cols + ["BILLED_AMT_EURO"] if "BILLED_AMT_EURO" in fleet_df.columns else po_cols
-        )
+        po_side_cols = [c for c in group_cols_fleet if c in fleet_df.columns]
+        po_dedup_cols = po_side_cols + [c for c in ["PO_QTY", "NET_PRICE_EURO"] if c in fleet_df.columns]
+        bill_dedup_cols = po_side_cols + [c for c in ["BILLED_QTY", "BILLED_AMT_EURO"] if c in fleet_df.columns]
 
-        po_grouped = po_agg.groupby(group_cols_fleet).agg(
-            TIMES_USED_PO=("PO_QTY", "count"),
-            **{"TOTAL_PO_EURO": ("NET_PRICE_EURO", "sum")} if "NET_PRICE_EURO" in po_agg.columns else {},
-        ).reset_index()
+        po_agg = fleet_df[fleet_df["PO_QTY"].notna()].drop_duplicates(subset=po_dedup_cols)
+        bill_agg = fleet_df[fleet_df["BILLED_QTY"].notna()].drop_duplicates(subset=bill_dedup_cols)
 
-        bill_grouped = bill_agg.groupby(group_cols_fleet).agg(
-            TIMES_BILLED=("BILLED_QTY", "count"),
-            **{"TOTAL_BILLED_EURO": ("BILLED_AMT_EURO", "sum")} if "BILLED_AMT_EURO" in bill_agg.columns else {},
-        ).reset_index()
+        po_agg_dict = {"TIMES_USED_PO": ("PO_QTY", "count")}
+        if "NET_PRICE_EURO" in po_agg.columns:
+            po_agg_dict["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
+
+        bill_agg_dict = {"TIMES_BILLED": ("BILLED_QTY", "count")}
+        if "BILLED_AMT_EURO" in bill_agg.columns:
+            bill_agg_dict["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
+
+        po_grouped = po_agg.groupby(group_cols_fleet).agg(**po_agg_dict).reset_index()
+        bill_grouped = bill_agg.groupby(group_cols_fleet).agg(**bill_agg_dict).reset_index()
 
         fleet_analysis = po_grouped.merge(bill_grouped, on=group_cols_fleet, how="outer")
         fleet_analysis["TIMES_USED_PO"] = fleet_analysis["TIMES_USED_PO"].fillna(0).astype(int)
