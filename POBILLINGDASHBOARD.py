@@ -63,6 +63,11 @@ def load_and_merge(po_file, billing_file):
         billing_df["MATL_ID_TRIM"] = billing_df["MATL_ID_TRIM"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
         po_left_on.append("MATERIAL_ID")
         billing_right_on.append("MATL_ID_TRIM")
+    if "VEHICLE_ID" in po_df.columns and "VEHICLE_ID" in billing_df.columns:
+        po_df["VEHICLE_ID"] = po_df["VEHICLE_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+        billing_df["VEHICLE_ID"] = billing_df["VEHICLE_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+        po_left_on.append("VEHICLE_ID")
+        billing_right_on.append("VEHICLE_ID")
 
     if not po_left_on:
         st.error(
