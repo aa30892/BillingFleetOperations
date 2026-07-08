@@ -3,6 +3,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import io
 from collections import defaultdict
 
 st.set_page_config(page_title="PO vs Billing Dashboard", layout="wide")
@@ -20,8 +21,10 @@ if po_file is None or billing_file is None:
 
 @st.cache_data
 def load_and_merge(po_bytes, billing_bytes, po_name, billing_name):
-    po_df = pd.read_parquet(po_bytes) if po_name.endswith(".parquet") else pd.read_csv(po_bytes)
-    billing_df = pd.read_parquet(billing_bytes) if billing_name.endswith(".parquet") else pd.read_csv(billing_bytes)
+    po_buf = io.BytesIO(po_bytes)
+    billing_buf = io.BytesIO(billing_bytes)
+    po_df = pd.read_parquet(po_buf) if po_name.endswith(".parquet") else pd.read_csv(po_buf)
+    billing_df = pd.read_parquet(billing_buf) if billing_name.endswith(".parquet") else pd.read_csv(billing_buf)
     po_df.columns = po_df.columns.str.upper()
     billing_df.columns = billing_df.columns.str.upper()
     if "PO_POSTING_DATE" in po_df.columns:
@@ -79,7 +82,7 @@ def load_and_merge(po_bytes, billing_bytes, po_name, billing_name):
     return merged
 
 
-merged = load_and_merge(po_file, billing_file, po_file.name, billing_file.name)
+merged = load_and_merge(po_file.getvalue(), billing_file.getvalue(), po_file.name, billing_file.name)
 
 vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
 
@@ -256,135 +259,6 @@ with tab_dashboard:
     )
 
 with tab_repair:
-    st.subheader("Materials Used on Repair Jobs (by Vehicle)")
-    st.markdown("When `JOB_TYPE_CODE = 'repair'`, what other materials are used? Ranked from highest to lowest quantity.")
-
-    job_type_col = None
-    for col_name in ["JOB_TYPE_CODE", "JOB_TYPE_CD", "JOB_TYPE_CODE_PO", "JOB_TYPE_CD_PO", "JOB_TYPE_CODE_BILL", "JOB_TYPE_CD_BILL"]:
-        if col_name in filtered.columns:
-            job_type_col = col_name
-            break
-
-    if job_type_col is None:
-        st.warning("No JOB_TYPE column found in the data. Ensure your CSV includes JOB_TYPE_CODE or JOB_TYPE_CD.")
-    else:
-        repair_mask = filtered[job_type_col].astype(str).str.lower().str.contains("repair", na=False)
-        repair_df = filtered[repair_mask]
-
-        if repair_df.empty:
-            st.info("No repair jobs found in the filtered data.")
-        else:
-            st.metric("Total Repair Records", f"{len(repair_df):,}", border=True)
-
-            repair_ranking = (
-                repair_df.groupby("MATERIAL_ID_COMBINED")
-                .agg(
-                    TOTAL_PO_QTY=("PO_QTY", "sum"),
-                    TOTAL_BILLED_QTY=("BILLED_QTY", "sum"),
-                    JOB_COUNT=("JOB_ID_COMBINED", "count"),
-                )
-                .reset_index()
-            )
-            repair_ranking["TOTAL_QTY"] = repair_ranking["TOTAL_PO_QTY"].fillna(0) + repair_ranking["TOTAL_BILLED_QTY"].fillna(0)
-            repair_ranking = repair_ranking.sort_values("TOTAL_QTY", ascending=False).reset_index(drop=True)
-            repair_ranking.index = repair_ranking.index + 1
-            repair_ranking.index.name = "Rank"
-
-            with st.container(border=True):
-                st.markdown("**Top Materials on Repair Jobs**")
-                st.bar_chart(
-                    repair_ranking.head(20).set_index("MATERIAL_ID_COMBINED")[["TOTAL_PO_QTY", "TOTAL_BILLED_QTY"]]
-                )
-
-            st.dataframe(
-                repair_ranking.rename(columns={
-                    "MATERIAL_ID_COMBINED": "Material ID",
-                    "TOTAL_PO_QTY": "Total PO Qty",
-                    "TOTAL_BILLED_QTY": "Total Billed Qty",
-                    "TOTAL_QTY": "Combined Qty",
-                    "JOB_COUNT": "Job Count",
-                }),
-                use_container_width=True,
-            )
-
-    st.divider()
-    st.subheader("Vendors with Service & Repair on Same Vehicle & Same Date")
-    st.markdown("Identifies vendors that logged both `service` and `repair` job types on the same vehicle on the same PO posting date.")
-
-    vehicle_col = None
-    for vc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID", "VEHICLE_REG_NUMBER", "VEHICLE_REG_NBR"]:
-        if vc in filtered.columns:
-            vehicle_col = vc
-            break
-
-    vendor_display_col = None
-    for vnc in ["VENDOR_NAME", "VEND_NAME", "VENDOR_NAME_PO", "VEND_NAME_BILL"]:
-        if vnc in filtered.columns:
-            vendor_display_col = vnc
-            break
-
-    if job_type_col is None or vehicle_col is None or vendor_display_col is None:
-        st.warning("Missing required columns (JOB_TYPE, VEHICLE, or VENDOR). Ensure your CSVs include these fields.")
-    else:
-        svc_mask = filtered[job_type_col].astype(str).str.lower().str.contains("service", na=False)
-        rep_mask = filtered[job_type_col].astype(str).str.lower().str.contains("repair", na=False)
-
-        service_records = filtered[svc_mask][[vendor_display_col, vehicle_col, "PO_POSTING_DATE_COMBINED", "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]].copy()
-        repair_records = filtered[rep_mask][[vendor_display_col, vehicle_col, "PO_POSTING_DATE_COMBINED", "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]].copy()
-
-        if service_records.empty or repair_records.empty:
-            st.info("No overlap found — need both service and repair records in the filtered data.")
-        else:
-            overlap = service_records.merge(
-                repair_records,
-                on=[vendor_display_col, vehicle_col, "PO_POSTING_DATE_COMBINED"],
-                how="inner",
-                suffixes=("_SERVICE", "_REPAIR"),
-            )
-
-            if overlap.empty:
-                st.info("No vendors found with both service and repair on the same vehicle and same date.")
-            else:
-                vendor_summary = (
-                    overlap.groupby(vendor_display_col)
-                    .agg(
-                        OCCURRENCES=(vehicle_col, "count"),
-                        VEHICLES=(vehicle_col, "nunique"),
-                    )
-                    .reset_index()
-                    .sort_values("OCCURRENCES", ascending=False)
-                    .reset_index(drop=True)
-                )
-                vendor_summary.index = vendor_summary.index + 1
-                vendor_summary.index.name = "Rank"
-
-                st.metric("Vendors Flagged", len(vendor_summary), border=True)
-
-                st.dataframe(
-                    vendor_summary.rename(columns={
-                        vendor_display_col: "Vendor Name",
-                        "OCCURRENCES": "Occurrences",
-                        "VEHICLES": "Unique Vehicles",
-                    }),
-                    use_container_width=True,
-                )
-
-                with st.expander("Detail: Overlapping Records"):
-                    st.dataframe(
-                        overlap.rename(columns={
-                            vendor_display_col: "Vendor",
-                            vehicle_col: "Vehicle",
-                            "PO_POSTING_DATE_COMBINED": "Date",
-                            "JOB_ID_COMBINED_SERVICE": "Service Job ID",
-                            "MATERIAL_ID_COMBINED_SERVICE": "Service Material",
-                            "JOB_ID_COMBINED_REPAIR": "Repair Job ID",
-                            "MATERIAL_ID_COMBINED_REPAIR": "Repair Material",
-                        }),
-                        hide_index=True,
-                        use_container_width=True,
-                    )
-
-    st.divider()
     st.subheader("Fleet Type Analysis — Materials per Job & Vehicle")
     st.markdown("Breaks down by `FLEET_TYPE` which materials are used per job and vehicle, with quantities and descriptions.")
 
@@ -399,6 +273,13 @@ with tab_repair:
         if vc in filtered.columns:
             vehicle_col_fleet = vc
             break
+
+    licence_col_fleet = None
+    if vehicle_col_fleet and "VEHICLE" in vehicle_col_fleet.upper():
+        for lc in ["LICENCE_PLATE", "LICENCE_PLATE_ID"]:
+            if lc in filtered.columns:
+                licence_col_fleet = lc
+                break
 
     mat_desc_fleet = None
     for mc in ["MATERIAL_DESC", "MATERIAL_DESC_PO", "MATL_DESC", "MATL_DESC_PO", "MATL_DESC_BILL"]:
@@ -418,22 +299,34 @@ with tab_repair:
         if selected_fleet:
             fleet_df = fleet_df[fleet_df[fleet_col].astype(str).isin(selected_fleet)]
 
-        group_cols_fleet = ["JOB_ID_COMBINED", vehicle_col_fleet, "MATERIAL_ID_COMBINED"]
+        group_cols_fleet = ["JOB_ID_COMBINED", vehicle_col_fleet]
+        if licence_col_fleet:
+            group_cols_fleet.append(licence_col_fleet)
+        group_cols_fleet.append("MATERIAL_ID_COMBINED")
         if mat_desc_fleet:
             group_cols_fleet.append(mat_desc_fleet)
         group_cols_fleet.append(fleet_col)
 
+        agg_dict = {
+            "TIMES_USED_PO": ("PO_QTY", lambda x: x.notna().sum()),
+            "TIMES_BILLED": ("BILLED_QTY", lambda x: x.notna().sum()),
+            "TOTAL_PO_QTY": ("PO_QTY", "sum"),
+            "TOTAL_BILLED_QTY": ("BILLED_QTY", "sum"),
+        }
+        if "NET_PRICE_EURO" in fleet_df.columns:
+            agg_dict["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
+        if "BILLED_AMT_EURO" in fleet_df.columns:
+            agg_dict["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
+
         fleet_analysis = (
             fleet_df.groupby(group_cols_fleet)
-            .agg(
-                PO_QTY=("PO_QTY", "sum"),
-                BILLED_QTY=("BILLED_QTY", "sum"),
-                OCCURRENCES=("JOB_ID_COMBINED", "count"),
-            )
+            .agg(**agg_dict)
             .reset_index()
         )
-        fleet_analysis["QTY_DIFF"] = fleet_analysis["PO_QTY"].fillna(0) - fleet_analysis["BILLED_QTY"].fillna(0)
-        fleet_analysis = fleet_analysis.sort_values(["PO_QTY"], ascending=False).reset_index(drop=True)
+        fleet_analysis["QTY_DIFF"] = fleet_analysis["TOTAL_PO_QTY"].fillna(0) - fleet_analysis["TOTAL_BILLED_QTY"].fillna(0)
+        if "TOTAL_PO_EURO" in fleet_analysis.columns and "TOTAL_BILLED_EURO" in fleet_analysis.columns:
+            fleet_analysis["EURO_DIFF"] = fleet_analysis["TOTAL_PO_EURO"].fillna(0) - fleet_analysis["TOTAL_BILLED_EURO"].fillna(0)
+        fleet_analysis = fleet_analysis.sort_values(["TIMES_USED_PO"], ascending=False).reset_index(drop=True)
 
         with st.container(horizontal=True):
             st.metric("Fleet Types", len(fleet_types), border=True)
@@ -457,14 +350,20 @@ with tab_repair:
 
         rename_map_fleet = {
             "JOB_ID_COMBINED": "Job ID",
-            vehicle_col_fleet: "Vehicle",
+            vehicle_col_fleet: "Vehicle ID",
             "MATERIAL_ID_COMBINED": "Material ID",
             fleet_col: "Fleet Type",
-            "PO_QTY": "PO Qty",
-            "BILLED_QTY": "Billed Qty",
-            "QTY_DIFF": "Qty Diff",
-            "OCCURRENCES": "Times Used",
+            "TIMES_USED_PO": "Times Used PO",
+            "TIMES_BILLED": "Times Billed",
+            "TOTAL_PO_QTY": "Total PO Qty",
+            "TOTAL_BILLED_QTY": "Total Billed Qty",
+            "QTY_DIFF": "Qty Difference",
+            "TOTAL_PO_EURO": "PO € Total",
+            "TOTAL_BILLED_EURO": "Billed € Total",
+            "EURO_DIFF": "€ Difference",
         }
+        if licence_col_fleet:
+            rename_map_fleet[licence_col_fleet] = "Licence Plate"
         if mat_desc_fleet:
             rename_map_fleet[mat_desc_fleet] = "Material Description"
 
@@ -554,6 +453,81 @@ with tab_anomaly:
                     )
                 else:
                     st.info("Not enough data for heatmap.")
+
+                st.divider()
+                st.subheader("Vendor Anomaly Heatmap — Job Type Patterns")
+                st.markdown("Flags vendors with suspicious job type patterns: **Regular Breakdown**, **Regular Job**, **Turn on Rim**, and **Inspection on same vehicle > 2 times**.")
+
+                job_type_col_anom = None
+                for jtc in ["JOB_TYPE_CODE", "JOB_TYPE_CD", "JOB_TYPE_CODE_PO", "JOB_TYPE_CD_PO", "JOB_TYPE_CODE_BILL", "JOB_TYPE_CD_BILL"]:
+                    if jtc in filtered.columns:
+                        job_type_col_anom = jtc
+                        break
+
+                vehicle_col_anom = None
+                for vhc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID", "VEHICLE_REG_NBR"]:
+                    if vhc in filtered.columns:
+                        vehicle_col_anom = vhc
+                        break
+
+                if job_type_col_anom is None or vehicle_col_anom is None:
+                    st.warning("Missing JOB_TYPE or VEHICLE column — cannot compute job type anomaly heatmap.")
+                else:
+                    job_types_lower = filtered[job_type_col_anom].astype(str).str.lower().str.strip()
+
+                    reg_breakdown = filtered[job_types_lower.str.contains("regular.*breakdown|breakdown.*regular", na=False)]
+                    reg_job = filtered[job_types_lower.str.contains("regular.*job|job.*regular", na=False)]
+                    turn_on_rim = filtered[job_types_lower.str.contains("turn.*on.*rim", na=False)]
+
+                    inspection_counts = (
+                        filtered[job_types_lower.str.contains("inspection", na=False)]
+                        .groupby([vendor_col_anom, vehicle_col_anom])
+                        .size()
+                        .reset_index(name="INSP_COUNT")
+                    )
+                    insp_exceed = inspection_counts[inspection_counts["INSP_COUNT"] > 2]
+                    insp_vendors = set(insp_exceed[vendor_col_anom].unique()) if not insp_exceed.empty else set()
+
+                    anomaly_rows = []
+                    all_vendors = set()
+
+                    if not reg_breakdown.empty:
+                        for v in reg_breakdown[vendor_col_anom].unique():
+                            cnt = int((reg_breakdown[vendor_col_anom] == v).sum())
+                            anomaly_rows.append({"Vendor": v, "Anomaly": "Regular Breakdown", "Count": cnt})
+                            all_vendors.add(v)
+
+                    if not reg_job.empty:
+                        for v in reg_job[vendor_col_anom].unique():
+                            cnt = int((reg_job[vendor_col_anom] == v).sum())
+                            anomaly_rows.append({"Vendor": v, "Anomaly": "Regular Job", "Count": cnt})
+                            all_vendors.add(v)
+
+                    if not turn_on_rim.empty:
+                        for v in turn_on_rim[vendor_col_anom].unique():
+                            cnt = int((turn_on_rim[vendor_col_anom] == v).sum())
+                            anomaly_rows.append({"Vendor": v, "Anomaly": "Turn on Rim", "Count": cnt})
+                            all_vendors.add(v)
+
+                    if not insp_exceed.empty:
+                        for v in insp_vendors:
+                            cnt = int(insp_exceed[insp_exceed[vendor_col_anom] == v]["INSP_COUNT"].sum())
+                            anomaly_rows.append({"Vendor": v, "Anomaly": "Inspection >2 Same Vehicle", "Count": cnt})
+                            all_vendors.add(v)
+
+                    if anomaly_rows:
+                        anomaly_df = pd.DataFrame(anomaly_rows)
+                        pivot_anomaly = anomaly_df.pivot_table(
+                            index="Vendor", columns="Anomaly", values="Count", fill_value=0, aggfunc="sum"
+                        ).sort_values(by=list(anomaly_df["Anomaly"].unique()), ascending=False)
+
+                        st.dataframe(pivot_anomaly, use_container_width=True)
+
+                        with st.container(horizontal=True):
+                            st.metric("Vendors Flagged", len(all_vendors), border=True)
+                            st.metric("Total Flags", sum(r["Count"] for r in anomaly_rows), border=True)
+                    else:
+                        st.success("No job type anomaly patterns detected in the filtered data.")
 
                 st.divider()
                 st.subheader("Top Offending Vendors")
@@ -794,6 +768,13 @@ with tab_anomaly:
             vehicle_col_mat = vc
             break
 
+    licence_col_mat = None
+    if vehicle_col_mat and "VEHICLE" in vehicle_col_mat.upper():
+        for lc in ["LICENCE_PLATE", "LICENCE_PLATE_ID"]:
+            if lc in filtered.columns:
+                licence_col_mat = lc
+                break
+
     mat_desc_col = None
     for mc in ["MATERIAL_DESC", "MATERIAL_DESC_PO", "MATL_DESC", "MATL_DESC_PO", "MATL_DESC_BILL"]:
         if mc in filtered.columns:
@@ -809,6 +790,8 @@ with tab_anomaly:
             group_cols.append(mat_desc_col)
         if vehicle_col_mat:
             group_cols.append(vehicle_col_mat)
+        if licence_col_mat:
+            group_cols.append(licence_col_mat)
 
         mat_usage = (
             filtered.groupby(group_cols)
@@ -849,7 +832,9 @@ with tab_anomaly:
             if mat_desc_col:
                 rename_map[mat_desc_col] = "Material Description"
             if vehicle_col_mat:
-                rename_map[vehicle_col_mat] = "Vehicle"
+                rename_map[vehicle_col_mat] = "Vehicle ID"
+            if licence_col_mat:
+                rename_map[licence_col_mat] = "Licence Plate"
 
             st.dataframe(
                 discrepancies.drop(columns=["HAS_DISCREPANCY"]).rename(columns=rename_map),
