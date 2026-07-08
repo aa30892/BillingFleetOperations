@@ -10,18 +10,18 @@ st.title("PO vs Billing Comparison")
 
 with st.sidebar:
     st.header("Upload Data")
-    po_file = st.file_uploader("Upload PO data (CSV)", type=["csv"])
-    billing_file = st.file_uploader("Upload Billing data (CSV)", type=["csv"])
+    po_file = st.file_uploader("Upload PO data (CSV or Parquet)", type=["csv", "parquet"])
+    billing_file = st.file_uploader("Upload Billing data (CSV or Parquet)", type=["csv", "parquet"])
 
 if po_file is None or billing_file is None:
-    st.info("Please upload both PO and Billing CSV files to proceed.")
+    st.info("Please upload both PO and Billing files to proceed.")
     st.stop()
 
 
 @st.cache_data
-def load_and_merge(po_bytes, billing_bytes):
-    po_df = pd.read_csv(po_bytes)
-    billing_df = pd.read_csv(billing_bytes)
+def load_and_merge(po_bytes, billing_bytes, po_name, billing_name):
+    po_df = pd.read_parquet(po_bytes) if po_name.endswith(".parquet") else pd.read_csv(po_bytes)
+    billing_df = pd.read_parquet(billing_bytes) if billing_name.endswith(".parquet") else pd.read_csv(billing_bytes)
     po_df.columns = po_df.columns.str.upper()
     billing_df.columns = billing_df.columns.str.upper()
     if "PO_POSTING_DATE" in po_df.columns:
@@ -46,7 +46,7 @@ def load_and_merge(po_bytes, billing_bytes):
     return merged
 
 
-merged = load_and_merge(po_file, billing_file)
+merged = load_and_merge(po_file, billing_file, po_file.name, billing_file.name)
 
 vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
 
