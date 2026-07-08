@@ -185,7 +185,7 @@ def build_customer_groups(customer_names):
     return groups
 
 
-all_customers = [x for x in merged["CUSTOMER_NAME_COMBINED"].unique().tolist() if x != "nan" and x.strip() != ""]
+all_customers = [x for x in merged["CUSTOMER_NAME_COMBINED"].unique().tolist() if isinstance(x, str) and x != "nan" and x.strip() != ""]
 all_customers.sort()
 customer_group_map = build_customer_groups(all_customers)
 merged["CUSTOMER_GROUP"] = merged["CUSTOMER_NAME_COMBINED"].map(customer_group_map).fillna(merged["CUSTOMER_NAME_COMBINED"])
@@ -193,12 +193,12 @@ merged["CUSTOMER_GROUP"] = merged["CUSTOMER_NAME_COMBINED"].map(customer_group_m
 with st.sidebar:
     st.header("Filters")
 
-    contracts = [x for x in merged["CONTRACT_ID_COMBINED"].unique().tolist() if x != "nan" and x.strip() != ""]
+    contracts = [x for x in merged["CONTRACT_ID_COMBINED"].unique().tolist() if isinstance(x, str) and x != "nan" and x.strip() != ""]
     contracts.sort()
     selected_contracts = st.multiselect("Contract ID", contracts, key="filter_contracts")
 
     customer_groups = sorted(merged["CUSTOMER_GROUP"].dropna().unique().tolist())
-    customer_groups = [x for x in customer_groups if x != "nan" and x.strip() != ""]
+    customer_groups = [x for x in customer_groups if isinstance(x, str) and x != "nan" and x.strip() != ""]
     selected_customer_groups = st.multiselect(
         "Customer Group",
         customer_groups,
@@ -206,7 +206,7 @@ with st.sidebar:
         key="filter_customer_groups",
     )
 
-    customers = [x for x in merged["CUSTOMER_NAME_COMBINED"].unique().tolist() if x != "nan" and x.strip() != ""]
+    customers = [x for x in merged["CUSTOMER_NAME_COMBINED"].unique().tolist() if isinstance(x, str) and x != "nan" and x.strip() != ""]
     customers.sort()
     selected_customers = st.multiselect("Customer Name", customers, key="filter_customers")
 
