@@ -98,6 +98,16 @@ def load_and_merge(po_file, billing_file):
         .astype(str).str.replace(r'\.\d+$', '', regex=True)
     )
 
+    # Combine VEHICLE_ID from both sources (suffixed after merge since both tables have it)
+    if "VEHICLE_ID_PO" in merged.columns or "VEHICLE_ID_BILL" in merged.columns:
+        merged["VEHICLE_ID"] = (
+            safe_col(merged, "VEHICLE_ID_PO")
+            .combine_first(safe_col(merged, "VEHICLE_ID_BILL"))
+            .astype(str)
+        )
+    elif "VEHICLE_ID" not in merged.columns:
+        pass  # no vehicle column at all
+
     if "BILLING_DT" in merged.columns and "PO_POSTING_DATE" in merged.columns:
         merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].combine_first(merged["BILLING_DT"])
     elif "PO_POSTING_DATE" in merged.columns:
