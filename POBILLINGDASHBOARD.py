@@ -31,12 +31,33 @@ def load_and_merge(po_file, billing_file):
             billing_df = pd.read_parquet(billing_buf)
         else:
             billing_df = pd.read_csv(billing_buf)
+        del po_buf, billing_buf
     except Exception as e:
         st.error(f"Error reading files: {e}")
         st.stop()
 
     po_df.columns = po_df.columns.str.upper().str.strip()
     billing_df.columns = billing_df.columns.str.upper().str.strip()
+
+    # Keep only columns the app actually uses to reduce memory
+    po_keep = [
+        "FLEET_TYPE", "FLEET_CUSTOMER_GROUP", "PO_POSTING_DATE", "PO_POSTING_MONTH",
+        "CUSTOMER_COUNTRY_ID", "FOS_CONTRACT_TYPE", "FOS_CONTRACT_ID",
+        "CUSTOMER_NAME", "CUSTOMER_DEPOT", "JOB_NOTIFICATION_ID", "JOB_DATE",
+        "JOB_TYPE_CODE", "MATERIAL_ID", "MATERIAL_DESC", "MATERIAL_GROUP_DESC",
+        "MATERIAL_TYPE_DESC", "FOS_MATERIAL_TYPE", "VEHICLE_ID", "LICENCE_PLATE",
+        "VENDOR_NAME", "VENDOR_ID", "VENDOR_COUNTRY_CODE", "PO_QTY",
+        "NET_PRICE_LOCAL", "NET_PRICE_EURO",
+    ]
+    billing_keep = [
+        "BILLING_DT", "CONTRACT_ID", "CUST_NAME", "CUST_CNTRY_CD",
+        "MATL_ID_TRIM", "MATL_DESC", "MATL_GRP_DESC", "MATL_TYPE_DESC",
+        "JOB_ID", "JOB_DATE", "JOB_TYPE_CD", "VEND_NAME",
+        "LICENCE_PLATE_ID", "VEHICLE_ID", "VEHICLE_REG_NBR",
+        "BILLED_QTY", "BILLED_AMT_LOCAL", "BILLED_AMT_EURO",
+    ]
+    po_df = po_df[[c for c in po_keep if c in po_df.columns]]
+    billing_df = billing_df[[c for c in billing_keep if c in billing_df.columns]]
 
     # Show debug info
     with st.sidebar.expander("Debug: Column Info", expanded=False):
@@ -499,78 +520,92 @@ with tab_repair:
         if selected_cg:
             cg_filtered = filtered[filtered["CUSTOMER_GROUP"] == selected_cg]
 
-            vehicle_col_cg = None
-            for vc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID"]:
-                if vc in cg_filtered.columns:
-                    vehicle_col_cg = vc
-                    break
-
-            licence_col_cg = None
-            if vehicle_col_cg and "VEHICLE" in vehicle_col_cg.upper():
-                for lc in ["LICENCE_PLATE", "LICENCE_PLATE_ID"]:
-                    if lc in cg_filtered.columns:
-                        licence_col_cg = lc
+            if cg_filtered.empty:
+                st.info("No data for the selected customer group.")
+            else:
+                vehicle_col_cg = None
+                for vc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID"]:
+                    if vc in cg_filtered.columns:
+                        vehicle_col_cg = vc
                         break
 
-            mat_desc_cg = None
-            for mc in ["MATERIAL_DESC", "MATERIAL_DESC_PO", "MATL_DESC", "MATL_DESC_PO", "MATL_DESC_BILL"]:
-                if mc in cg_filtered.columns:
-                    mat_desc_cg = mc
-                    break
+                licence_col_cg = None
+                if vehicle_col_cg and "VEHICLE" in vehicle_col_cg.upper():
+                    for lc in ["LICENCE_PLATE", "LICENCE_PLATE_ID"]:
+                        if lc in cg_filtered.columns:
+                            licence_col_cg = lc
+                            break
 
-            group_cols_cg = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]
-            if vehicle_col_cg:
-                group_cols_cg.append(vehicle_col_cg)
-            if licence_col_cg:
-                group_cols_cg.append(licence_col_cg)
-            if mat_desc_cg:
-                group_cols_cg.append(mat_desc_cg)
+                mat_desc_cg = None
+                for mc in ["MATERIAL_DESC", "MATERIAL_DESC_PO", "MATL_DESC", "MATL_DESC_PO", "MATL_DESC_BILL"]:
+                    if mc in cg_filtered.columns:
+                        mat_desc_cg = mc
+                        break
 
-            cg_po_detail = cg_filtered[cg_filtered["PO_QTY"].notna()].groupby(group_cols_cg).agg(
-                TIMES_USED_PO=("PO_QTY", "count"),
-                **{"TOTAL_PO_EURO": ("NET_PRICE_EURO", "sum")} if "NET_PRICE_EURO" in cg_filtered.columns else {},
-            ).reset_index()
-
-            cg_bill_detail = cg_filtered[cg_filtered["BILLED_QTY"].notna()].groupby(group_cols_cg).agg(
-                TIMES_BILLED=("BILLED_QTY", "count"),
-                **{"TOTAL_BILLED_EURO": ("BILLED_AMT_EURO", "sum")} if "BILLED_AMT_EURO" in cg_filtered.columns else {},
-            ).reset_index()
-
-            cg_detail = cg_po_detail.merge(cg_bill_detail, on=group_cols_cg, how="outer")
-            cg_detail["TIMES_USED_PO"] = cg_detail["TIMES_USED_PO"].fillna(0).astype(int)
-            cg_detail["TIMES_BILLED"] = cg_detail["TIMES_BILLED"].fillna(0).astype(int)
-            if "TOTAL_PO_EURO" in cg_detail.columns and "TOTAL_BILLED_EURO" in cg_detail.columns:
-                cg_detail["EURO_DIFF"] = cg_detail["TOTAL_PO_EURO"].fillna(0) - cg_detail["TOTAL_BILLED_EURO"].fillna(0)
-            cg_detail = cg_detail.sort_values("TIMES_USED_PO", ascending=False).reset_index(drop=True)
-
-            with st.container(horizontal=True):
-                st.metric("Jobs", cg_detail["JOB_ID_COMBINED"].nunique(), border=True)
-                st.metric("Materials", cg_detail["MATERIAL_ID_COMBINED"].nunique(), border=True)
+                group_cols_cg = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]
                 if vehicle_col_cg:
-                    st.metric("Vehicles", cg_detail[vehicle_col_cg].nunique(), border=True)
-                st.metric("Records", len(cg_detail), border=True)
+                    group_cols_cg.append(vehicle_col_cg)
+                if licence_col_cg:
+                    group_cols_cg.append(licence_col_cg)
+                if mat_desc_cg:
+                    group_cols_cg.append(mat_desc_cg)
 
-            cg_detail_rename = {
-                "JOB_ID_COMBINED": "Job ID",
-                "MATERIAL_ID_COMBINED": "Material ID",
-                "TIMES_USED_PO": "Times Used PO",
-                "TIMES_BILLED": "Times Billed",
-                "TOTAL_PO_EURO": "PO € Total",
-                "TOTAL_BILLED_EURO": "Billed € Total",
-                "EURO_DIFF": "€ Difference",
-            }
-            if vehicle_col_cg:
-                cg_detail_rename[vehicle_col_cg] = "Vehicle ID"
-            if licence_col_cg:
-                cg_detail_rename[licence_col_cg] = "Licence Plate"
-            if mat_desc_cg:
-                cg_detail_rename[mat_desc_cg] = "Material Description"
+                po_side = cg_filtered[cg_filtered["PO_QTY"].notna()]
+                bill_side = cg_filtered[cg_filtered["BILLED_QTY"].notna()]
 
-            st.dataframe(
-                cg_detail.rename(columns=cg_detail_rename),
-                hide_index=True,
-                use_container_width=True,
-            )
+                po_agg_dict = {"TIMES_USED_PO": ("PO_QTY", "count")}
+                if "NET_PRICE_EURO" in po_side.columns:
+                    po_agg_dict["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
+
+                bill_agg_dict = {"TIMES_BILLED": ("BILLED_QTY", "count")}
+                if "BILLED_AMT_EURO" in bill_side.columns:
+                    bill_agg_dict["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
+
+                if not po_side.empty:
+                    cg_po_detail = po_side.groupby(group_cols_cg).agg(**po_agg_dict).reset_index()
+                else:
+                    cg_po_detail = pd.DataFrame(columns=group_cols_cg + list(po_agg_dict.keys()))
+
+                if not bill_side.empty:
+                    cg_bill_detail = bill_side.groupby(group_cols_cg).agg(**bill_agg_dict).reset_index()
+                else:
+                    cg_bill_detail = pd.DataFrame(columns=group_cols_cg + list(bill_agg_dict.keys()))
+
+                cg_detail = cg_po_detail.merge(cg_bill_detail, on=group_cols_cg, how="outer")
+                cg_detail["TIMES_USED_PO"] = cg_detail["TIMES_USED_PO"].fillna(0).astype(int)
+                cg_detail["TIMES_BILLED"] = cg_detail["TIMES_BILLED"].fillna(0).astype(int)
+                if "TOTAL_PO_EURO" in cg_detail.columns and "TOTAL_BILLED_EURO" in cg_detail.columns:
+                    cg_detail["EURO_DIFF"] = cg_detail["TOTAL_PO_EURO"].fillna(0) - cg_detail["TOTAL_BILLED_EURO"].fillna(0)
+                cg_detail = cg_detail.sort_values("TIMES_USED_PO", ascending=False).reset_index(drop=True)
+
+                with st.container(horizontal=True):
+                    st.metric("Jobs", cg_detail["JOB_ID_COMBINED"].nunique(), border=True)
+                    st.metric("Materials", cg_detail["MATERIAL_ID_COMBINED"].nunique(), border=True)
+                    if vehicle_col_cg:
+                        st.metric("Vehicles", cg_detail[vehicle_col_cg].nunique(), border=True)
+                    st.metric("Records", len(cg_detail), border=True)
+
+                cg_detail_rename = {
+                    "JOB_ID_COMBINED": "Job ID",
+                    "MATERIAL_ID_COMBINED": "Material ID",
+                    "TIMES_USED_PO": "Times Used PO",
+                    "TIMES_BILLED": "Times Billed",
+                    "TOTAL_PO_EURO": "PO € Total",
+                    "TOTAL_BILLED_EURO": "Billed € Total",
+                    "EURO_DIFF": "€ Difference",
+                }
+                if vehicle_col_cg:
+                    cg_detail_rename[vehicle_col_cg] = "Vehicle ID"
+                if licence_col_cg:
+                    cg_detail_rename[licence_col_cg] = "Licence Plate"
+                if mat_desc_cg:
+                    cg_detail_rename[mat_desc_cg] = "Material Description"
+
+                st.dataframe(
+                    cg_detail.rename(columns=cg_detail_rename),
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
 with tab_anomaly:
     st.subheader("AI Anomaly Detection — Vendor Behaviour vs Material")
