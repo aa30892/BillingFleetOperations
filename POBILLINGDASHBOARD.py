@@ -489,6 +489,89 @@ with tab_repair:
             use_container_width=True,
         )
 
+        st.divider()
+        st.subheader("Materials per Job & Vehicle — by Customer Group")
+        st.markdown("Select a customer group to see detailed material usage per job and vehicle.")
+
+        cg_list = sorted(cg_analysis["CUSTOMER_GROUP"].dropna().unique().tolist())
+        selected_cg = st.selectbox("Select Customer Group", cg_list, key="cg_detail_filter")
+
+        if selected_cg:
+            cg_filtered = filtered[filtered["CUSTOMER_GROUP"] == selected_cg]
+
+            vehicle_col_cg = None
+            for vc in ["VEHICLE_ID", "VEHICLE_ID_PO", "LICENCE_PLATE", "LICENCE_PLATE_ID"]:
+                if vc in cg_filtered.columns:
+                    vehicle_col_cg = vc
+                    break
+
+            licence_col_cg = None
+            if vehicle_col_cg and "VEHICLE" in vehicle_col_cg.upper():
+                for lc in ["LICENCE_PLATE", "LICENCE_PLATE_ID"]:
+                    if lc in cg_filtered.columns:
+                        licence_col_cg = lc
+                        break
+
+            mat_desc_cg = None
+            for mc in ["MATERIAL_DESC", "MATERIAL_DESC_PO", "MATL_DESC", "MATL_DESC_PO", "MATL_DESC_BILL"]:
+                if mc in cg_filtered.columns:
+                    mat_desc_cg = mc
+                    break
+
+            group_cols_cg = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]
+            if vehicle_col_cg:
+                group_cols_cg.append(vehicle_col_cg)
+            if licence_col_cg:
+                group_cols_cg.append(licence_col_cg)
+            if mat_desc_cg:
+                group_cols_cg.append(mat_desc_cg)
+
+            cg_po_detail = cg_filtered[cg_filtered["PO_QTY"].notna()].groupby(group_cols_cg).agg(
+                TIMES_USED_PO=("PO_QTY", "count"),
+                **{"TOTAL_PO_EURO": ("NET_PRICE_EURO", "sum")} if "NET_PRICE_EURO" in cg_filtered.columns else {},
+            ).reset_index()
+
+            cg_bill_detail = cg_filtered[cg_filtered["BILLED_QTY"].notna()].groupby(group_cols_cg).agg(
+                TIMES_BILLED=("BILLED_QTY", "count"),
+                **{"TOTAL_BILLED_EURO": ("BILLED_AMT_EURO", "sum")} if "BILLED_AMT_EURO" in cg_filtered.columns else {},
+            ).reset_index()
+
+            cg_detail = cg_po_detail.merge(cg_bill_detail, on=group_cols_cg, how="outer")
+            cg_detail["TIMES_USED_PO"] = cg_detail["TIMES_USED_PO"].fillna(0).astype(int)
+            cg_detail["TIMES_BILLED"] = cg_detail["TIMES_BILLED"].fillna(0).astype(int)
+            if "TOTAL_PO_EURO" in cg_detail.columns and "TOTAL_BILLED_EURO" in cg_detail.columns:
+                cg_detail["EURO_DIFF"] = cg_detail["TOTAL_PO_EURO"].fillna(0) - cg_detail["TOTAL_BILLED_EURO"].fillna(0)
+            cg_detail = cg_detail.sort_values("TIMES_USED_PO", ascending=False).reset_index(drop=True)
+
+            with st.container(horizontal=True):
+                st.metric("Jobs", cg_detail["JOB_ID_COMBINED"].nunique(), border=True)
+                st.metric("Materials", cg_detail["MATERIAL_ID_COMBINED"].nunique(), border=True)
+                if vehicle_col_cg:
+                    st.metric("Vehicles", cg_detail[vehicle_col_cg].nunique(), border=True)
+                st.metric("Records", len(cg_detail), border=True)
+
+            cg_detail_rename = {
+                "JOB_ID_COMBINED": "Job ID",
+                "MATERIAL_ID_COMBINED": "Material ID",
+                "TIMES_USED_PO": "Times Used PO",
+                "TIMES_BILLED": "Times Billed",
+                "TOTAL_PO_EURO": "PO € Total",
+                "TOTAL_BILLED_EURO": "Billed € Total",
+                "EURO_DIFF": "€ Difference",
+            }
+            if vehicle_col_cg:
+                cg_detail_rename[vehicle_col_cg] = "Vehicle ID"
+            if licence_col_cg:
+                cg_detail_rename[licence_col_cg] = "Licence Plate"
+            if mat_desc_cg:
+                cg_detail_rename[mat_desc_cg] = "Material Description"
+
+            st.dataframe(
+                cg_detail.rename(columns=cg_detail_rename),
+                hide_index=True,
+                use_container_width=True,
+            )
+
 with tab_anomaly:
     st.subheader("AI Anomaly Detection — Vendor Behaviour vs Material")
     st.markdown("Analyses vendor billing patterns per material description, flagging suspicious behaviour using IQR-based outlier detection.")
