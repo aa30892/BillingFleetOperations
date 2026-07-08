@@ -54,13 +54,13 @@ def load_and_merge(po_file, billing_file):
     po_left_on = []
     billing_right_on = []
     if "JOB_NOTIFICATION_ID" in po_df.columns and "JOB_ID" in billing_df.columns:
-        po_df["JOB_NOTIFICATION_ID"] = po_df["JOB_NOTIFICATION_ID"].astype(str).str.strip().str.rstrip(".0")
-        billing_df["JOB_ID"] = billing_df["JOB_ID"].astype(str).str.strip().str.rstrip(".0")
+        po_df["JOB_NOTIFICATION_ID"] = po_df["JOB_NOTIFICATION_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+        billing_df["JOB_ID"] = billing_df["JOB_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
         po_left_on.append("JOB_NOTIFICATION_ID")
         billing_right_on.append("JOB_ID")
     if "MATERIAL_ID" in po_df.columns and "MATL_ID_TRIM" in billing_df.columns:
-        po_df["MATERIAL_ID"] = po_df["MATERIAL_ID"].astype(str).str.strip().str.rstrip(".0")
-        billing_df["MATL_ID_TRIM"] = billing_df["MATL_ID_TRIM"].astype(str).str.strip().str.rstrip(".0")
+        po_df["MATERIAL_ID"] = po_df["MATERIAL_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+        billing_df["MATL_ID_TRIM"] = billing_df["MATL_ID_TRIM"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
         po_left_on.append("MATERIAL_ID")
         billing_right_on.append("MATL_ID_TRIM")
 
@@ -263,8 +263,10 @@ with tab_dashboard:
     with col1:
         with st.container(border=True):
             st.markdown("**NET_PRICE_EURO vs BILLED_AMT_EURO**")
-            chart_price = summary[["MATERIAL_ID_COMBINED", "PO_NET_PRICE_EURO", "BILLED_AMT_EURO"]].set_index(
-                "MATERIAL_ID_COMBINED"
+            chart_price = (
+                summary[["MATERIAL_ID_COMBINED", "PO_NET_PRICE_EURO", "BILLED_AMT_EURO"]]
+                .sort_values("PO_NET_PRICE_EURO", ascending=False)
+                .set_index("MATERIAL_ID_COMBINED")
             )
             st.bar_chart(chart_price)
 
@@ -362,8 +364,6 @@ with tab_repair:
         agg_dict = {
             "TIMES_USED_PO": ("PO_QTY", lambda x: x.notna().sum()),
             "TIMES_BILLED": ("BILLED_QTY", lambda x: x.notna().sum()),
-            "TOTAL_PO_QTY": ("PO_QTY", "sum"),
-            "TOTAL_BILLED_QTY": ("BILLED_QTY", "sum"),
         }
         if "NET_PRICE_EURO" in fleet_df.columns:
             agg_dict["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
@@ -375,7 +375,6 @@ with tab_repair:
             .agg(**agg_dict)
             .reset_index()
         )
-        fleet_analysis["QTY_DIFF"] = fleet_analysis["TOTAL_PO_QTY"].fillna(0) - fleet_analysis["TOTAL_BILLED_QTY"].fillna(0)
         if "TOTAL_PO_EURO" in fleet_analysis.columns and "TOTAL_BILLED_EURO" in fleet_analysis.columns:
             fleet_analysis["EURO_DIFF"] = fleet_analysis["TOTAL_PO_EURO"].fillna(0) - fleet_analysis["TOTAL_BILLED_EURO"].fillna(0)
         fleet_analysis = fleet_analysis.sort_values(["TIMES_USED_PO"], ascending=False).reset_index(drop=True)
@@ -407,9 +406,6 @@ with tab_repair:
             fleet_col: "Fleet Type",
             "TIMES_USED_PO": "Times Used PO",
             "TIMES_BILLED": "Times Billed",
-            "TOTAL_PO_QTY": "Total PO Qty",
-            "TOTAL_BILLED_QTY": "Total Billed Qty",
-            "QTY_DIFF": "Qty Difference",
             "TOTAL_PO_EURO": "PO € Total",
             "TOTAL_BILLED_EURO": "Billed € Total",
             "EURO_DIFF": "€ Difference",
