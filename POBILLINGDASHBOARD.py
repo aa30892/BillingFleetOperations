@@ -20,93 +20,109 @@ if po_file is None or billing_file is None:
 
 
 def load_and_merge(po_file, billing_file):
-    po_buf = io.BytesIO(po_file.getvalue())
-    billing_buf = io.BytesIO(billing_file.getvalue())
-    if po_file.name.endswith(".parquet"):
-        po_df = pd.read_parquet(po_buf)
-    else:
-        po_df = pd.read_csv(po_buf)
-    if billing_file.name.endswith(".parquet"):
-        billing_df = pd.read_parquet(billing_buf)
-    else:
-        billing_df = pd.read_csv(billing_buf)
+    try:
+        po_buf = io.BytesIO(po_file.getvalue())
+        billing_buf = io.BytesIO(billing_file.getvalue())
+        if po_file.name.endswith(".parquet"):
+            po_df = pd.read_parquet(po_buf)
+        else:
+            po_df = pd.read_csv(po_buf)
+        if billing_file.name.endswith(".parquet"):
+            billing_df = pd.read_parquet(billing_buf)
+        else:
+            billing_df = pd.read_csv(billing_buf)
+    except Exception as e:
+        st.error(f"Error reading files: {e}")
+        st.stop()
 
     po_df.columns = po_df.columns.str.upper().str.strip()
     billing_df.columns = billing_df.columns.str.upper().str.strip()
+
+    # Show debug info
+    with st.sidebar.expander("Debug: Column Info", expanded=False):
+        st.write("PO columns:", list(po_df.columns))
+        st.write("PO rows:", len(po_df))
+        st.write("Billing columns:", list(billing_df.columns))
+        st.write("Billing rows:", len(billing_df))
 
     if "PO_POSTING_DATE" in po_df.columns:
         po_df["PO_POSTING_DATE"] = pd.to_datetime(po_df["PO_POSTING_DATE"], errors="coerce")
     if "BILLING_DT" in billing_df.columns:
         billing_df["BILLING_DT"] = pd.to_datetime(billing_df["BILLING_DT"], errors="coerce")
 
-    # Determine join keys and cast to string
+    # Determine join keys and cast to string to avoid type mismatches
     po_left_on = []
     billing_right_on = []
     if "JOB_NOTIFICATION_ID" in po_df.columns and "JOB_ID" in billing_df.columns:
-        po_df["JOB_NOTIFICATION_ID"] = po_df["JOB_NOTIFICATION_ID"].astype(str).str.strip()
-        billing_df["JOB_ID"] = billing_df["JOB_ID"].astype(str).str.strip()
+        po_df["JOB_NOTIFICATION_ID"] = po_df["JOB_NOTIFICATION_ID"].astype(str).str.strip().str.rstrip(".0")
+        billing_df["JOB_ID"] = billing_df["JOB_ID"].astype(str).str.strip().str.rstrip(".0")
         po_left_on.append("JOB_NOTIFICATION_ID")
         billing_right_on.append("JOB_ID")
     if "MATERIAL_ID" in po_df.columns and "MATL_ID_TRIM" in billing_df.columns:
-        po_df["MATERIAL_ID"] = po_df["MATERIAL_ID"].astype(str).str.strip()
-        billing_df["MATL_ID_TRIM"] = billing_df["MATL_ID_TRIM"].astype(str).str.strip()
+        po_df["MATERIAL_ID"] = po_df["MATERIAL_ID"].astype(str).str.strip().str.rstrip(".0")
+        billing_df["MATL_ID_TRIM"] = billing_df["MATL_ID_TRIM"].astype(str).str.strip().str.rstrip(".0")
         po_left_on.append("MATERIAL_ID")
         billing_right_on.append("MATL_ID_TRIM")
 
     if not po_left_on:
         st.error(
-            f"Cannot merge files. PO columns: {list(po_df.columns[:10])}... "
-            f"Billing columns: {list(billing_df.columns[:10])}... "
+            f"Cannot merge files. PO columns: {list(po_df.columns)}. "
+            f"Billing columns: {list(billing_df.columns)}. "
             f"Expected: JOB_NOTIFICATION_ID/JOB_ID and MATERIAL_ID/MATL_ID_TRIM."
         )
         st.stop()
 
-    merged = po_df.merge(
-        billing_df,
-        left_on=po_left_on,
-        right_on=billing_right_on,
-        how="outer",
-        suffixes=("_PO", "_BILL"),
-    )
+    try:
+        merged = po_df.merge(
+            billing_df,
+            left_on=po_left_on,
+            right_on=billing_right_on,
+            how="outer",
+            suffixes=("_PO", "_BILL"),
+        )
+    except Exception as e:
+        st.error(f"Merge failed: {e}")
+        st.stop()
 
     # Build combined columns safely
-    def safe_col(df, col):
-        return df[col] if col in df.columns else pd.Series(pd.NA, index=df.index, dtype="object")
+    def get_col(df, col):
+        if col in df.columns:
+            return df[col]
+        return pd.Series(np.nan, index=df.index)
 
     if "FOS_CONTRACT_ID" in merged.columns or "CONTRACT_ID" in merged.columns:
         merged["CONTRACT_ID_COMBINED"] = (
-            safe_col(merged, "FOS_CONTRACT_ID")
-            .combine_first(safe_col(merged, "CONTRACT_ID"))
-            .astype(str).str.replace(r'\.\d+$', '', regex=True)
+            get_col(merged, "FOS_CONTRACT_ID")
+            .combine_first(get_col(merged, "CONTRACT_ID"))
+            .astype(str).str.replace(r'\.0$', '', regex=True)
         )
     else:
         merged["CONTRACT_ID_COMBINED"] = "N/A"
 
     merged["CUSTOMER_NAME_COMBINED"] = (
-        safe_col(merged, "CUSTOMER_NAME")
-        .combine_first(safe_col(merged, "CUST_NAME"))
+        get_col(merged, "CUSTOMER_NAME")
+        .combine_first(get_col(merged, "CUST_NAME"))
+        .fillna("Unknown")
         .astype(str)
     )
     merged["MATERIAL_ID_COMBINED"] = (
-        safe_col(merged, "MATERIAL_ID")
-        .combine_first(safe_col(merged, "MATL_ID_TRIM"))
-        .astype(str).str.replace(r'\.\d+$', '', regex=True)
+        get_col(merged, "MATERIAL_ID")
+        .combine_first(get_col(merged, "MATL_ID_TRIM"))
+        .astype(str).str.replace(r'\.0$', '', regex=True)
     )
     merged["JOB_ID_COMBINED"] = (
-        safe_col(merged, "JOB_NOTIFICATION_ID")
-        .combine_first(safe_col(merged, "JOB_ID"))
-        .astype(str).str.replace(r'\.\d+$', '', regex=True)
+        get_col(merged, "JOB_NOTIFICATION_ID")
+        .combine_first(get_col(merged, "JOB_ID"))
+        .astype(str).str.replace(r'\.0$', '', regex=True)
     )
 
     # Combine VEHICLE_ID from both sources (suffixed after merge since both tables have it)
     if "VEHICLE_ID_PO" in merged.columns or "VEHICLE_ID_BILL" in merged.columns:
         merged["VEHICLE_ID"] = (
-            safe_col(merged, "VEHICLE_ID_PO")
-            .combine_first(safe_col(merged, "VEHICLE_ID_BILL"))
+            get_col(merged, "VEHICLE_ID_PO")
+            .combine_first(get_col(merged, "VEHICLE_ID_BILL"))
             .astype(str)
         )
-    elif "VEHICLE_ID" not in merged.columns:
-        pass  # no vehicle column at all
 
     if "BILLING_DT" in merged.columns and "PO_POSTING_DATE" in merged.columns:
         merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].combine_first(merged["BILLING_DT"])
