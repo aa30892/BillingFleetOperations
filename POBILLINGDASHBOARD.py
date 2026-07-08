@@ -28,21 +28,54 @@ def load_and_merge(po_bytes, billing_bytes, po_name, billing_name):
         po_df["PO_POSTING_DATE"] = pd.to_datetime(po_df["PO_POSTING_DATE"])
     if "BILLING_DT" in billing_df.columns:
         billing_df["BILLING_DT"] = pd.to_datetime(billing_df["BILLING_DT"])
+    po_left_on = []
+    billing_right_on = []
+    if "JOB_NOTIFICATION_ID" in po_df.columns and "JOB_ID" in billing_df.columns:
+        po_left_on.append("JOB_NOTIFICATION_ID")
+        billing_right_on.append("JOB_ID")
+    if "MATERIAL_ID" in po_df.columns and "MATL_ID_TRIM" in billing_df.columns:
+        po_left_on.append("MATERIAL_ID")
+        billing_right_on.append("MATL_ID_TRIM")
+    if not po_left_on:
+        raise KeyError(
+            f"Cannot merge: PO columns {list(po_df.columns)} and Billing columns "
+            f"{list(billing_df.columns)} do not contain the expected join keys "
+            f"(JOB_NOTIFICATION_ID/JOB_ID and MATERIAL_ID/MATL_ID_TRIM)."
+        )
     merged = po_df.merge(
         billing_df,
-        left_on=["JOB_NOTIFICATION_ID", "MATERIAL_ID"],
-        right_on=["JOB_ID", "MATL_ID_TRIM"],
+        left_on=po_left_on,
+        right_on=billing_right_on,
         how="outer",
         suffixes=("_PO", "_BILL"),
     )
-    merged["CONTRACT_ID_COMBINED"] = merged["FOS_CONTRACT_ID"].combine_first(merged["CONTRACT_ID"]).astype(str).str.replace(r'\.\d+$', '', regex=True)
-    merged["CUSTOMER_NAME_COMBINED"] = merged["CUSTOMER_NAME"].combine_first(merged["CUST_NAME"]).astype(str)
-    merged["MATERIAL_ID_COMBINED"] = merged["MATERIAL_ID"].combine_first(merged["MATL_ID_TRIM"]).astype(str).str.replace(r'\.\d+$', '', regex=True)
-    merged["JOB_ID_COMBINED"] = merged["JOB_NOTIFICATION_ID"].combine_first(merged["JOB_ID"]).astype(str).str.replace(r'\.\d+$', '', regex=True)
-    if "BILLING_DT" in merged.columns:
-        merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].combine_first(merged["BILLING_DT"])
+    if "FOS_CONTRACT_ID" in merged.columns or "CONTRACT_ID" in merged.columns:
+        fos_col = merged["FOS_CONTRACT_ID"] if "FOS_CONTRACT_ID" in merged.columns else pd.Series(np.nan, index=merged.index)
+        con_col = merged["CONTRACT_ID"] if "CONTRACT_ID" in merged.columns else pd.Series(np.nan, index=merged.index)
+        merged["CONTRACT_ID_COMBINED"] = fos_col.combine_first(con_col).astype(str).str.replace(r'\.\d+$', '', regex=True)
     else:
+        merged["CONTRACT_ID_COMBINED"] = "N/A"
+    merged["CUSTOMER_NAME_COMBINED"] = (
+        (merged["CUSTOMER_NAME"] if "CUSTOMER_NAME" in merged.columns else pd.Series(np.nan, index=merged.index))
+        .combine_first(merged["CUST_NAME"] if "CUST_NAME" in merged.columns else pd.Series(np.nan, index=merged.index))
+        .astype(str)
+    )
+    merged["MATERIAL_ID_COMBINED"] = (
+        (merged["MATERIAL_ID"] if "MATERIAL_ID" in merged.columns else pd.Series(np.nan, index=merged.index))
+        .combine_first(merged["MATL_ID_TRIM"] if "MATL_ID_TRIM" in merged.columns else pd.Series(np.nan, index=merged.index))
+        .astype(str).str.replace(r'\.\d+$', '', regex=True)
+    )
+    merged["JOB_ID_COMBINED"] = (
+        (merged["JOB_NOTIFICATION_ID"] if "JOB_NOTIFICATION_ID" in merged.columns else pd.Series(np.nan, index=merged.index))
+        .combine_first(merged["JOB_ID"] if "JOB_ID" in merged.columns else pd.Series(np.nan, index=merged.index))
+        .astype(str).str.replace(r'\.\d+$', '', regex=True)
+    )
+    if "BILLING_DT" in merged.columns and "PO_POSTING_DATE" in merged.columns:
+        merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"].combine_first(merged["BILLING_DT"])
+    elif "PO_POSTING_DATE" in merged.columns:
         merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"]
+    elif "BILLING_DT" in merged.columns:
+        merged["PO_POSTING_DATE_COMBINED"] = merged["BILLING_DT"]
     return merged
 
 
