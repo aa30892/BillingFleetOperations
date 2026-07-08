@@ -269,8 +269,9 @@ with tab_dashboard:
         with st.container(border=True):
             st.markdown("**NET_PRICE_EURO vs BILLED_AMT_EURO**")
             chart_price = (
-                summary[["MATERIAL_ID_COMBINED", "PO_NET_PRICE_EURO", "BILLED_AMT_EURO"]]
-                .sort_values("PO_NET_PRICE_EURO", ascending=False)
+                summary[["MATERIAL_ID_COMBINED", "PO_NET_PRICE_EURO", "BILLED_AMT_EURO", "PRICE_DIFF"]]
+                .sort_values("PRICE_DIFF", ascending=False)
+                .drop(columns=["PRICE_DIFF"])
                 .set_index("MATERIAL_ID_COMBINED")
             )
             st.bar_chart(chart_price)
@@ -430,6 +431,60 @@ with tab_repair:
 
         st.dataframe(
             fleet_analysis.rename(columns=rename_map_fleet),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    st.divider()
+    st.subheader("Customer Group Analysis — PO vs Billing")
+    st.markdown("Aggregates Times Used PO, Times Billed, PO € Total, and Billed € Total per **Customer Group**, highlighting discrepancies.")
+
+    if "CUSTOMER_GROUP" not in filtered.columns:
+        st.warning("No CUSTOMER_GROUP column found in the data.")
+    else:
+        cg_po = filtered[filtered["PO_QTY"].notna()].groupby("CUSTOMER_GROUP").agg(
+            TIMES_USED_PO=("PO_QTY", "count"),
+            **{"TOTAL_PO_EURO": ("NET_PRICE_EURO", "sum")} if "NET_PRICE_EURO" in filtered.columns else {},
+        ).reset_index()
+
+        cg_bill = filtered[filtered["BILLED_QTY"].notna()].groupby("CUSTOMER_GROUP").agg(
+            TIMES_BILLED=("BILLED_QTY", "count"),
+            **{"TOTAL_BILLED_EURO": ("BILLED_AMT_EURO", "sum")} if "BILLED_AMT_EURO" in filtered.columns else {},
+        ).reset_index()
+
+        cg_analysis = cg_po.merge(cg_bill, on="CUSTOMER_GROUP", how="outer")
+        cg_analysis["TIMES_USED_PO"] = cg_analysis["TIMES_USED_PO"].fillna(0).astype(int)
+        cg_analysis["TIMES_BILLED"] = cg_analysis["TIMES_BILLED"].fillna(0).astype(int)
+        if "TOTAL_PO_EURO" in cg_analysis.columns and "TOTAL_BILLED_EURO" in cg_analysis.columns:
+            cg_analysis["EURO_DIFF"] = cg_analysis["TOTAL_PO_EURO"].fillna(0) - cg_analysis["TOTAL_BILLED_EURO"].fillna(0)
+        cg_analysis = cg_analysis.sort_values("TIMES_USED_PO", ascending=False).reset_index(drop=True)
+
+        with st.container(horizontal=True):
+            st.metric("Customer Groups", len(cg_analysis), border=True)
+            if "EURO_DIFF" in cg_analysis.columns:
+                total_diff = cg_analysis["EURO_DIFF"].sum()
+                st.metric("Total € Difference", f"{total_diff:,.2f}", border=True)
+
+        with st.container(border=True):
+            st.markdown("**PO € vs Billed € by Customer Group**")
+            if "TOTAL_PO_EURO" in cg_analysis.columns and "TOTAL_BILLED_EURO" in cg_analysis.columns:
+                chart_cg = (
+                    cg_analysis[["CUSTOMER_GROUP", "TOTAL_PO_EURO", "TOTAL_BILLED_EURO"]]
+                    .sort_values("TOTAL_PO_EURO", ascending=False)
+                    .set_index("CUSTOMER_GROUP")
+                )
+                st.bar_chart(chart_cg)
+
+        cg_rename = {
+            "CUSTOMER_GROUP": "Customer Group",
+            "TIMES_USED_PO": "Times Used PO",
+            "TIMES_BILLED": "Times Billed",
+            "TOTAL_PO_EURO": "PO € Total",
+            "TOTAL_BILLED_EURO": "Billed € Total",
+            "EURO_DIFF": "€ Difference",
+        }
+        st.dataframe(
+            cg_analysis.rename(columns=cg_rename),
             hide_index=True,
             use_container_width=True,
         )
