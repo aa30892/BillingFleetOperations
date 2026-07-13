@@ -19,6 +19,7 @@ if po_file is None or billing_file is None:
     st.stop()
 
 
+@st.cache_data(show_spinner="Loading and merging data...")
 def load_and_merge(po_file, billing_file):
     try:
         po_buf = io.BytesIO(po_file.getvalue())
@@ -33,8 +34,7 @@ def load_and_merge(po_file, billing_file):
             billing_df = pd.read_csv(billing_buf)
         del po_buf, billing_buf
     except Exception as e:
-        st.error(f"Error reading files: {e}")
-        st.stop()
+        raise ValueError(f"Error reading files: {e}")
 
     po_df.columns = po_df.columns.str.upper().str.strip()
     billing_df.columns = billing_df.columns.str.upper().str.strip()
@@ -58,13 +58,6 @@ def load_and_merge(po_file, billing_file):
     ]
     po_df = po_df[[c for c in po_keep if c in po_df.columns]]
     billing_df = billing_df[[c for c in billing_keep if c in billing_df.columns]]
-
-    # Show debug info
-    with st.sidebar.expander("Debug: Column Info", expanded=False):
-        st.write("PO columns:", list(po_df.columns))
-        st.write("PO rows:", len(po_df))
-        st.write("Billing columns:", list(billing_df.columns))
-        st.write("Billing rows:", len(billing_df))
 
     if "PO_POSTING_DATE" in po_df.columns:
         po_df["PO_POSTING_DATE"] = pd.to_datetime(po_df["PO_POSTING_DATE"], errors="coerce")
@@ -91,12 +84,11 @@ def load_and_merge(po_file, billing_file):
         billing_right_on.append("VEHICLE_ID")
 
     if not po_left_on:
-        st.error(
+        raise ValueError(
             f"Cannot merge files. PO columns: {list(po_df.columns)}. "
             f"Billing columns: {list(billing_df.columns)}. "
             f"Expected: JOB_NOTIFICATION_ID/JOB_ID and MATERIAL_ID/MATL_ID_TRIM."
         )
-        st.stop()
 
     try:
         merged = po_df.merge(
@@ -107,8 +99,7 @@ def load_and_merge(po_file, billing_file):
             suffixes=("_PO", "_BILL"),
         )
     except Exception as e:
-        st.error(f"Merge failed: {e}")
-        st.stop()
+        raise ValueError(f"Merge failed: {e}")
 
     # Build combined columns safely
     def get_col(df, col):
@@ -160,11 +151,16 @@ def load_and_merge(po_file, billing_file):
     return merged
 
 
-merged = load_and_merge(po_file, billing_file)
+try:
+    merged = load_and_merge(po_file, billing_file)
+except ValueError as e:
+    st.error(str(e))
+    st.stop()
 
 vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in merged.columns else ("VEND_NAME" if "VEND_NAME" in merged.columns else None)
 
 
+@st.cache_data
 def build_customer_groups(customer_names):
     """Group customers by common keyword prefix (first word of the name).
     If multiple customers share the same first word, they are grouped under that word."""
@@ -732,35 +728,35 @@ with tab_anomaly:
                     insp_exceed = inspection_counts[inspection_counts["INSP_COUNT"] > 2]
                     insp_vendors = set(insp_exceed[vendor_col_anom].unique()) if not insp_exceed.empty else set()
 
-                    anomaly_rows = []
-                    all_vendors = set()
+                    anomaly_parts = []
 
                     if not reg_breakdown.empty:
-                        for v in reg_breakdown[vendor_col_anom].unique():
-                            cnt = int((reg_breakdown[vendor_col_anom] == v).sum())
-                            anomaly_rows.append({"Vendor": v, "Anomaly": "Regular Breakdown", "Count": cnt})
-                            all_vendors.add(v)
+                        rb = reg_breakdown.groupby(vendor_col_anom).size().reset_index(name="Count")
+                        rb["Anomaly"] = "Regular Breakdown"
+                        rb.rename(columns={vendor_col_anom: "Vendor"}, inplace=True)
+                        anomaly_parts.append(rb)
 
                     if not reg_job.empty:
-                        for v in reg_job[vendor_col_anom].unique():
-                            cnt = int((reg_job[vendor_col_anom] == v).sum())
-                            anomaly_rows.append({"Vendor": v, "Anomaly": "Regular Job", "Count": cnt})
-                            all_vendors.add(v)
+                        rj = reg_job.groupby(vendor_col_anom).size().reset_index(name="Count")
+                        rj["Anomaly"] = "Regular Job"
+                        rj.rename(columns={vendor_col_anom: "Vendor"}, inplace=True)
+                        anomaly_parts.append(rj)
 
                     if not turn_on_rim.empty:
-                        for v in turn_on_rim[vendor_col_anom].unique():
-                            cnt = int((turn_on_rim[vendor_col_anom] == v).sum())
-                            anomaly_rows.append({"Vendor": v, "Anomaly": "Turn on Rim", "Count": cnt})
-                            all_vendors.add(v)
+                        tr = turn_on_rim.groupby(vendor_col_anom).size().reset_index(name="Count")
+                        tr["Anomaly"] = "Turn on Rim"
+                        tr.rename(columns={vendor_col_anom: "Vendor"}, inplace=True)
+                        anomaly_parts.append(tr)
 
                     if not insp_exceed.empty:
-                        for v in insp_vendors:
-                            cnt = int(insp_exceed[insp_exceed[vendor_col_anom] == v]["INSP_COUNT"].sum())
-                            anomaly_rows.append({"Vendor": v, "Anomaly": "Inspection >2 Same Vehicle", "Count": cnt})
-                            all_vendors.add(v)
+                        ie = insp_exceed.groupby(vendor_col_anom)["INSP_COUNT"].sum().reset_index(name="Count")
+                        ie["Anomaly"] = "Inspection >2 Same Vehicle"
+                        ie.rename(columns={vendor_col_anom: "Vendor"}, inplace=True)
+                        anomaly_parts.append(ie)
 
-                    if anomaly_rows:
-                        anomaly_df = pd.DataFrame(anomaly_rows)
+                    if anomaly_parts:
+                        anomaly_df = pd.concat(anomaly_parts, ignore_index=True)
+                        all_vendors = set(anomaly_df["Vendor"].unique())
                         pivot_anomaly = anomaly_df.pivot_table(
                             index="Vendor", columns="Anomaly", values="Count", fill_value=0, aggfunc="sum"
                         ).sort_values(by=list(anomaly_df["Anomaly"].unique()), ascending=False)
@@ -769,7 +765,7 @@ with tab_anomaly:
 
                         with st.container(horizontal=True):
                             st.metric("Vendors Flagged", len(all_vendors), border=True)
-                            st.metric("Total Flags", sum(r["Count"] for r in anomaly_rows), border=True)
+                            st.metric("Total Flags", int(anomaly_df["Count"].sum()), border=True)
                     else:
                         st.success("No job type anomaly patterns detected in the filtered data.")
 
@@ -859,7 +855,7 @@ with tab_anomaly:
                 detail_cols.extend(["NET_PRICE_EURO", "BILLED_AMT_EURO", "PRICE_DIFF", "PO_QTY", "BILLED_QTY", "QTY_DIFF"])
 
                 available_detail = [c for c in detail_cols if c in combined_outliers.columns]
-                detail_df = combined_outliers[available_detail].sort_values("PRICE_DIFF", ascending=False, key=abs)
+                detail_df = combined_outliers[available_detail].sort_values("PRICE_DIFF", ascending=False, key=abs).head(500)
 
                 rename_detail = {
                     "JOB_ID_COMBINED": "Job ID",
@@ -1081,7 +1077,7 @@ with tab_anomaly:
                 rename_map[licence_col_mat] = "Licence Plate"
 
             st.dataframe(
-                discrepancies.drop(columns=["HAS_DISCREPANCY"]).rename(columns=rename_map),
+                discrepancies.head(1000).drop(columns=["HAS_DISCREPANCY"]).rename(columns=rename_map),
                 hide_index=True,
                 use_container_width=True,
             )
