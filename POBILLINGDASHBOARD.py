@@ -19,101 +19,172 @@ if po_file is None or billing_file is None:
     st.stop()
 
 
-@st.cache_data(show_spinner="Loading and merging data...")
+def _clean_keys(df, key_cols):
+    for k in key_cols:
+        df[k] = df[k].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+    return df
+
+
+# Descriptive text columns that repeat heavily and have bounded cardinality (at
+# most a few thousand distinct values in real exports) — safe to store as
+# category dtype. Deliberately excludes JOB_NOTIFICATION_ID, JOB_ID,
+# MATERIAL_ID, MATL_ID_TRIM, VEHICLE_ID, LICENCE_PLATE, LICENCE_PLATE_ID, and
+# VEHICLE_REG_NBR: those are near-unique per row and are also used as groupby
+# keys throughout the app, where categorical dtype risks pandas materializing
+# the full cartesian product of category levels if a groupby is ever missing
+# observed=True.
+SAFE_CATEGORY_COLS = [
+    "FLEET_TYPE", "CUSTOMER_NAME", "JOB_TYPE_CODE", "MATERIAL_DESC",
+    "VENDOR_NAME", "CUST_NAME", "MATL_DESC", "JOB_TYPE_CD", "VEND_NAME",
+    "CONTRACT_ID", "FOS_CONTRACT_ID",
+]
+
+
+def _categorize(df):
+    for col in SAFE_CATEGORY_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+    return df
+
+
+def _aggregate_frame(df, key_cols, numeric_sum_cols, count_col):
+    """Collapse df to one row per key_cols combination: sum numeric_sum_cols,
+    keep the first value of every other (descriptive) column, and add a count
+    of how many source rows were folded into each combo."""
+    desc_cols = [c for c in df.columns if c not in key_cols and c not in numeric_sum_cols]
+    agg_spec = {c: (c, "sum") for c in numeric_sum_cols}
+    agg_spec.update({c: (c, "first") for c in desc_cols})
+    counts = df.groupby(key_cols, dropna=False).size().reset_index(name=count_col)
+    agg = df.groupby(key_cols, dropna=False).agg(**agg_spec).reset_index()
+    return agg.merge(counts, on=key_cols, how="left")
+
+
+def load_and_preaggregate(file_obj, keep_cols, key_cols, numeric_sum_cols, count_col,
+                           date_col=None, chunksize=200_000):
+    """Read a PO/Billing export and collapse it to one row per key_cols combo,
+    without ever holding the full raw file in memory at once. CSVs are streamed
+    in chunks (each chunk aggregated immediately, then discarded); Parquet files
+    are read with column selection only, since columnar formats are already far
+    more memory-efficient than CSV for the same data."""
+    name = file_obj.name
+
+    if name.endswith(".parquet"):
+        buf = io.BytesIO(file_obj.getvalue())
+        df = pd.read_parquet(buf)
+        del buf
+        df.columns = df.columns.str.upper().str.strip()
+        present_keys = [k for k in key_cols if k in df.columns]
+        df = df[[c for c in keep_cols if c in df.columns] + [k for k in present_keys if k not in keep_cols]]
+        if date_col and date_col in df.columns:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = _clean_keys(df, present_keys)
+        df = _categorize(df)
+        numeric_present = [c for c in numeric_sum_cols if c in df.columns]
+        agg = _aggregate_frame(df, present_keys, numeric_present, count_col)
+        del df
+        return agg, present_keys
+
+    # CSV path: peek the header to resolve real column names/casing, then stream
+    # in chunks so we never hold more than one chunk of raw rows in memory.
+    header = pd.read_csv(io.BytesIO(file_obj.getvalue()), nrows=0)
+    header_map = {c.upper().strip(): c for c in header.columns}
+    present_keys = [k for k in key_cols if k in header_map]
+    usecols = [orig for upper, orig in header_map.items() if upper in keep_cols]
+    for k in present_keys:
+        if header_map[k] not in usecols:
+            usecols.append(header_map[k])
+
+    partial_aggs = []
+    reader = pd.read_csv(io.BytesIO(file_obj.getvalue()), usecols=usecols, chunksize=chunksize, low_memory=False)
+    for chunk in reader:
+        chunk.columns = chunk.columns.str.upper().str.strip()
+        if date_col and date_col in chunk.columns:
+            chunk[date_col] = pd.to_datetime(chunk[date_col], errors="coerce")
+        chunk = _clean_keys(chunk, present_keys)
+        chunk = _categorize(chunk)
+        numeric_present = [c for c in numeric_sum_cols if c in chunk.columns]
+        partial_aggs.append(_aggregate_frame(chunk, present_keys, numeric_present, count_col))
+        del chunk
+
+    combined = pd.concat(partial_aggs, ignore_index=True)
+    del partial_aggs
+    numeric_present = [c for c in numeric_sum_cols if c in combined.columns]
+    # Re-aggregate the concatenated per-chunk partials: sum the numeric totals AND
+    # the per-chunk counts, keep first descriptive value across chunks.
+    desc_cols = [c for c in combined.columns if c not in present_keys and c not in numeric_present and c != count_col]
+    final_spec = {c: (c, "sum") for c in numeric_present}
+    final_spec[count_col] = (count_col, "sum")
+    final_spec.update({c: (c, "first") for c in desc_cols})
+    agg = combined.groupby(present_keys, dropna=False).agg(**final_spec).reset_index()
+    del combined
+    return agg, present_keys
+
+
+@st.cache_data(show_spinner="Loading and aggregating data...")
 def load_and_merge(po_file, billing_file):
+    # Peek both headers first to decide which columns actually form valid join
+    # keys (same column must exist, under its expected name, on both sides).
+    def _peek_cols(f):
+        if f.name.endswith(".parquet"):
+            return set(pd.read_parquet(io.BytesIO(f.getvalue())).columns.str.upper().str.strip())
+        return set(pd.read_csv(io.BytesIO(f.getvalue()), nrows=0).columns.str.upper().str.strip())
+
     try:
-        po_buf = io.BytesIO(po_file.getvalue())
-        billing_buf = io.BytesIO(billing_file.getvalue())
-        if po_file.name.endswith(".parquet"):
-            po_df = pd.read_parquet(po_buf)
-        else:
-            po_df = pd.read_csv(po_buf)
-        if billing_file.name.endswith(".parquet"):
-            billing_df = pd.read_parquet(billing_buf)
-        else:
-            billing_df = pd.read_csv(billing_buf)
-        del po_buf, billing_buf
+        po_cols = _peek_cols(po_file)
+        billing_cols = _peek_cols(billing_file)
     except Exception as e:
         raise ValueError(f"Error reading files: {e}")
 
-    po_df.columns = po_df.columns.str.upper().str.strip()
-    billing_df.columns = billing_df.columns.str.upper().str.strip()
+    po_key_candidates, billing_key_candidates = [], []
+    if "JOB_NOTIFICATION_ID" in po_cols and "JOB_ID" in billing_cols:
+        po_key_candidates.append("JOB_NOTIFICATION_ID")
+        billing_key_candidates.append("JOB_ID")
+    if "MATERIAL_ID" in po_cols and "MATL_ID_TRIM" in billing_cols:
+        po_key_candidates.append("MATERIAL_ID")
+        billing_key_candidates.append("MATL_ID_TRIM")
+    if "VEHICLE_ID" in po_cols and "VEHICLE_ID" in billing_cols:
+        po_key_candidates.append("VEHICLE_ID")
+        billing_key_candidates.append("VEHICLE_ID")
 
-    # Keep only columns the app actually uses to reduce memory
-    po_keep = [
-        "FLEET_TYPE", "FLEET_CUSTOMER_GROUP", "PO_POSTING_DATE", "PO_POSTING_MONTH",
-        "CUSTOMER_COUNTRY_ID", "FOS_CONTRACT_TYPE", "FOS_CONTRACT_ID",
-        "CUSTOMER_NAME", "CUSTOMER_DEPOT", "JOB_NOTIFICATION_ID", "JOB_DATE",
-        "JOB_TYPE_CODE", "MATERIAL_ID", "MATERIAL_DESC", "MATERIAL_GROUP_DESC",
-        "MATERIAL_TYPE_DESC", "FOS_MATERIAL_TYPE", "VEHICLE_ID", "LICENCE_PLATE",
-        "VENDOR_NAME", "VENDOR_ID", "VENDOR_COUNTRY_CODE", "PO_QTY",
-        "NET_PRICE_LOCAL", "NET_PRICE_EURO",
-    ]
-    billing_keep = [
-        "BILLING_DT", "CONTRACT_ID", "CUST_NAME", "CUST_CNTRY_CD",
-        "MATL_ID_TRIM", "MATL_DESC", "MATL_GRP_DESC", "MATL_TYPE_DESC",
-        "JOB_ID", "JOB_DATE", "JOB_TYPE_CD", "VEND_NAME",
-        "LICENCE_PLATE_ID", "VEHICLE_ID", "VEHICLE_REG_NBR",
-        "BILLED_QTY", "BILLED_AMT_LOCAL", "BILLED_AMT_EURO",
-    ]
-    po_df = po_df[[c for c in po_keep if c in po_df.columns]]
-    billing_df = billing_df[[c for c in billing_keep if c in billing_df.columns]]
-
-    if "PO_POSTING_DATE" in po_df.columns:
-        po_df["PO_POSTING_DATE"] = pd.to_datetime(po_df["PO_POSTING_DATE"], errors="coerce")
-    if "BILLING_DT" in billing_df.columns:
-        billing_df["BILLING_DT"] = pd.to_datetime(billing_df["BILLING_DT"], errors="coerce")
-
-    # Determine join keys and cast to string to avoid type mismatches
-    po_left_on = []
-    billing_right_on = []
-    if "JOB_NOTIFICATION_ID" in po_df.columns and "JOB_ID" in billing_df.columns:
-        po_df["JOB_NOTIFICATION_ID"] = po_df["JOB_NOTIFICATION_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
-        billing_df["JOB_ID"] = billing_df["JOB_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
-        po_left_on.append("JOB_NOTIFICATION_ID")
-        billing_right_on.append("JOB_ID")
-    if "MATERIAL_ID" in po_df.columns and "MATL_ID_TRIM" in billing_df.columns:
-        po_df["MATERIAL_ID"] = po_df["MATERIAL_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
-        billing_df["MATL_ID_TRIM"] = billing_df["MATL_ID_TRIM"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
-        po_left_on.append("MATERIAL_ID")
-        billing_right_on.append("MATL_ID_TRIM")
-    if "VEHICLE_ID" in po_df.columns and "VEHICLE_ID" in billing_df.columns:
-        po_df["VEHICLE_ID"] = po_df["VEHICLE_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
-        billing_df["VEHICLE_ID"] = billing_df["VEHICLE_ID"].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
-        po_left_on.append("VEHICLE_ID")
-        billing_right_on.append("VEHICLE_ID")
-
-    if not po_left_on:
+    if not po_key_candidates:
         raise ValueError(
-            f"Cannot merge files. PO columns: {list(po_df.columns)}. "
-            f"Billing columns: {list(billing_df.columns)}. "
+            f"Cannot merge files. PO columns: {sorted(po_cols)}. "
+            f"Billing columns: {sorted(billing_cols)}. "
             f"Expected: JOB_NOTIFICATION_ID/JOB_ID and MATERIAL_ID/MATL_ID_TRIM."
         )
 
-    # --- Pre-aggregate each side to ONE row per join-key combination before merging. ---
-    # Merging at raw line level and then de-duplicating repeatedly downstream (once per
-    # tab section) is what was blowing up memory on real-size data: every section paid
-    # for its own full-dataframe .copy() + multi-column drop_duplicates() on the full
-    # merged table. Aggregating once here — and caching the result — means every
-    # downstream section can just group-and-sum the already-clean data cheaply.
-    try:
-        po_numeric_cols = [c for c in ["PO_QTY", "NET_PRICE_EURO", "NET_PRICE_LOCAL"] if c in po_df.columns]
-        po_desc_cols = [c for c in po_df.columns if c not in po_left_on and c not in po_numeric_cols]
-        po_agg_spec = {c: (c, "sum") for c in po_numeric_cols}
-        po_agg_spec.update({c: (c, "first") for c in po_desc_cols})
-        po_counts = po_df.groupby(po_left_on, dropna=False).size().reset_index(name="TIMES_USED_PO")
-        po_agg = po_df.groupby(po_left_on, dropna=False).agg(**po_agg_spec).reset_index()
-        po_agg = po_agg.merge(po_counts, on=po_left_on, how="left")
+    # Columns the app actually uses downstream. Deliberately excludes several
+    # columns that were being loaded and aggregated but never referenced in any
+    # tab, chart, filter, or display: JOB_DATE, the *_LOCAL currency fields,
+    # FLEET_CUSTOMER_GROUP, CUSTOMER_COUNTRY_ID, FOS_CONTRACT_TYPE,
+    # CUSTOMER_DEPOT, MATERIAL_GROUP_DESC/MATL_GRP_DESC, MATERIAL_TYPE_DESC/
+    # MATL_TYPE_DESC, FOS_MATERIAL_TYPE, VENDOR_COUNTRY_CODE, CUST_CNTRY_CD, and
+    # VENDOR_ID. None of these cost anything to drop functionally, and together
+    # they were a meaningful share of peak memory during aggregation.
+    po_keep = [
+        "FLEET_TYPE", "PO_POSTING_DATE", "PO_POSTING_MONTH", "FOS_CONTRACT_ID",
+        "CUSTOMER_NAME", "JOB_NOTIFICATION_ID", "JOB_TYPE_CODE", "MATERIAL_ID",
+        "MATERIAL_DESC", "VEHICLE_ID", "LICENCE_PLATE", "VENDOR_NAME",
+        "PO_QTY", "NET_PRICE_EURO",
+    ]
+    billing_keep = [
+        "BILLING_DT", "CONTRACT_ID", "CUST_NAME", "MATL_ID_TRIM", "MATL_DESC",
+        "JOB_ID", "JOB_TYPE_CD", "VEND_NAME",
+        "LICENCE_PLATE_ID", "VEHICLE_ID", "VEHICLE_REG_NBR",
+        "BILLED_QTY", "BILLED_AMT_EURO",
+    ]
 
-        bill_numeric_cols = [c for c in ["BILLED_QTY", "BILLED_AMT_EURO", "BILLED_AMT_LOCAL"] if c in billing_df.columns]
-        bill_desc_cols = [c for c in billing_df.columns if c not in billing_right_on and c not in bill_numeric_cols]
-        bill_agg_spec = {c: (c, "sum") for c in bill_numeric_cols}
-        bill_agg_spec.update({c: (c, "first") for c in bill_desc_cols})
-        bill_counts = billing_df.groupby(billing_right_on, dropna=False).size().reset_index(name="TIMES_BILLED")
-        bill_agg = billing_df.groupby(billing_right_on, dropna=False).agg(**bill_agg_spec).reset_index()
-        bill_agg = bill_agg.merge(bill_counts, on=billing_right_on, how="left")
+    try:
+        po_agg, po_left_on = load_and_preaggregate(
+            po_file, po_keep, po_key_candidates, ["PO_QTY", "NET_PRICE_EURO"],
+            "TIMES_USED_PO", date_col="PO_POSTING_DATE",
+        )
+        bill_agg, billing_right_on = load_and_preaggregate(
+            billing_file, billing_keep, billing_key_candidates, ["BILLED_QTY", "BILLED_AMT_EURO"],
+            "TIMES_BILLED", date_col="BILLING_DT",
+        )
     except Exception as e:
-        raise ValueError(f"Pre-aggregation failed: {e}")
+        raise ValueError(f"Error reading/aggregating files: {e}")
 
     try:
         merged = po_agg.merge(
@@ -125,6 +196,7 @@ def load_and_merge(po_file, billing_file):
         )
         merged["TIMES_USED_PO"] = merged["TIMES_USED_PO"].fillna(0).astype(int)
         merged["TIMES_BILLED"] = merged["TIMES_BILLED"].fillna(0).astype(int)
+        del po_agg, bill_agg
     except Exception as e:
         raise ValueError(f"Merge failed: {e}")
 
@@ -175,14 +247,20 @@ def load_and_merge(po_file, billing_file):
     elif "BILLING_DT" in merged.columns:
         merged["PO_POSTING_DATE_COMBINED"] = merged["BILLING_DT"]
 
+    # The raw join-key columns are now fully superseded by their *_COMBINED
+    # versions and never referenced again downstream. They're also the biggest
+    # memory cost in the whole table (high-cardinality object columns), so drop
+    # them rather than carry duplicate copies of the same identifiers around.
+    merged = merged.drop(
+        columns=[c for c in ["JOB_NOTIFICATION_ID", "JOB_ID", "MATERIAL_ID", "MATL_ID_TRIM",
+                              "PO_POSTING_DATE", "BILLING_DT"] if c in merged.columns]
+    )
+
     # Memory optimization: repeated text columns (names, IDs, descriptions) compress
     # heavily as categoricals; numeric columns rarely need full float64/int64 range.
     category_candidates = [
-        "FLEET_TYPE", "FLEET_CUSTOMER_GROUP", "CUSTOMER_COUNTRY_ID", "FOS_CONTRACT_TYPE",
-        "CUSTOMER_NAME", "CUSTOMER_DEPOT", "JOB_TYPE_CODE", "MATERIAL_DESC",
-        "MATERIAL_GROUP_DESC", "MATERIAL_TYPE_DESC", "FOS_MATERIAL_TYPE",
-        "VENDOR_NAME", "VENDOR_ID", "VENDOR_COUNTRY_CODE", "CUST_NAME", "CUST_CNTRY_CD",
-        "MATL_DESC", "MATL_GRP_DESC", "MATL_TYPE_DESC", "JOB_TYPE_CD", "VEND_NAME",
+        "FLEET_TYPE", "CUSTOMER_NAME", "JOB_TYPE_CODE", "MATERIAL_DESC",
+        "VENDOR_NAME", "CUST_NAME", "MATL_DESC", "JOB_TYPE_CD", "VEND_NAME",
         "CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED", "MATERIAL_ID_COMBINED",
     ]
     # Deliberately NOT categorized: JOB_ID_COMBINED, VEHICLE_ID, LICENCE_PLATE,
@@ -493,6 +571,7 @@ with tab_repair:
             hide_index=True,
             use_container_width=True,
         )
+        del fleet_analysis, fleet_df
 
     st.divider()
     st.subheader("Customer Group Analysis — PO vs Billing")
@@ -644,6 +723,18 @@ with tab_anomaly:
         filtered["PRICE_DIFF"] = filtered["NET_PRICE_EURO"].fillna(0) - filtered["BILLED_AMT_EURO"].fillna(0)
         filtered["QTY_DIFF"] = filtered["PO_QTY"].fillna(0) - filtered["BILLED_QTY"].fillna(0)
 
+        # Outlier frames only ever need this handful of columns downstream (vendor
+        # heatmap, top-offender tables, detail view) — slicing to them before
+        # running IQR detection keeps price_outliers/qty_outliers/combined_outliers
+        # a fraction of the size of the full 40+ column merged table.
+        anomaly_cols = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED", "PRICE_DIFF", "QTY_DIFF",
+                         "NET_PRICE_EURO", "BILLED_AMT_EURO", "PO_QTY", "BILLED_QTY"]
+        if vendor_col_anom:
+            anomaly_cols.append(vendor_col_anom)
+        if mat_desc_anom:
+            anomaly_cols.append(mat_desc_anom)
+        anomaly_slice = filtered[[c for c in anomaly_cols if c in filtered.columns]]
+
         def detect_anomalies(df, column):
             data = df[column].dropna()
             if data.empty or data.std() == 0:
@@ -655,8 +746,8 @@ with tab_anomaly:
             upper = q3 + 1.5 * iqr
             return df[(df[column] < lower) | (df[column] > upper)]
 
-        price_outliers = detect_anomalies(filtered, "PRICE_DIFF")
-        qty_outliers = detect_anomalies(filtered, "QTY_DIFF")
+        price_outliers = detect_anomalies(anomaly_slice, "PRICE_DIFF")
+        qty_outliers = detect_anomalies(anomaly_slice, "QTY_DIFF")
 
         total_anomalies = len(price_outliers) + len(qty_outliers)
         with st.container(horizontal=True):
@@ -675,6 +766,7 @@ with tab_anomaly:
 
         if vendor_col_anom and mat_desc_anom:
             combined_outliers = pd.concat([price_outliers, qty_outliers]).drop_duplicates(subset=["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"])
+            del price_outliers, qty_outliers, anomaly_slice
 
             if not combined_outliers.empty:
                 vendor_mat_counts = (
