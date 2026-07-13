@@ -90,14 +90,41 @@ def load_and_merge(po_file, billing_file):
             f"Expected: JOB_NOTIFICATION_ID/JOB_ID and MATERIAL_ID/MATL_ID_TRIM."
         )
 
+    # --- Pre-aggregate each side to ONE row per join-key combination before merging. ---
+    # Merging at raw line level and then de-duplicating repeatedly downstream (once per
+    # tab section) is what was blowing up memory on real-size data: every section paid
+    # for its own full-dataframe .copy() + multi-column drop_duplicates() on the full
+    # merged table. Aggregating once here — and caching the result — means every
+    # downstream section can just group-and-sum the already-clean data cheaply.
     try:
-        merged = po_df.merge(
-            billing_df,
+        po_numeric_cols = [c for c in ["PO_QTY", "NET_PRICE_EURO", "NET_PRICE_LOCAL"] if c in po_df.columns]
+        po_desc_cols = [c for c in po_df.columns if c not in po_left_on and c not in po_numeric_cols]
+        po_agg_spec = {c: (c, "sum") for c in po_numeric_cols}
+        po_agg_spec.update({c: (c, "first") for c in po_desc_cols})
+        po_counts = po_df.groupby(po_left_on, dropna=False).size().reset_index(name="TIMES_USED_PO")
+        po_agg = po_df.groupby(po_left_on, dropna=False).agg(**po_agg_spec).reset_index()
+        po_agg = po_agg.merge(po_counts, on=po_left_on, how="left")
+
+        bill_numeric_cols = [c for c in ["BILLED_QTY", "BILLED_AMT_EURO", "BILLED_AMT_LOCAL"] if c in billing_df.columns]
+        bill_desc_cols = [c for c in billing_df.columns if c not in billing_right_on and c not in bill_numeric_cols]
+        bill_agg_spec = {c: (c, "sum") for c in bill_numeric_cols}
+        bill_agg_spec.update({c: (c, "first") for c in bill_desc_cols})
+        bill_counts = billing_df.groupby(billing_right_on, dropna=False).size().reset_index(name="TIMES_BILLED")
+        bill_agg = billing_df.groupby(billing_right_on, dropna=False).agg(**bill_agg_spec).reset_index()
+        bill_agg = bill_agg.merge(bill_counts, on=billing_right_on, how="left")
+    except Exception as e:
+        raise ValueError(f"Pre-aggregation failed: {e}")
+
+    try:
+        merged = po_agg.merge(
+            bill_agg,
             left_on=po_left_on,
             right_on=billing_right_on,
             how="outer",
             suffixes=("_PO", "_BILL"),
         )
+        merged["TIMES_USED_PO"] = merged["TIMES_USED_PO"].fillna(0).astype(int)
+        merged["TIMES_BILLED"] = merged["TIMES_BILLED"].fillna(0).astype(int)
     except Exception as e:
         raise ValueError(f"Merge failed: {e}")
 
@@ -147,6 +174,31 @@ def load_and_merge(po_file, billing_file):
         merged["PO_POSTING_DATE_COMBINED"] = merged["PO_POSTING_DATE"]
     elif "BILLING_DT" in merged.columns:
         merged["PO_POSTING_DATE_COMBINED"] = merged["BILLING_DT"]
+
+    # Memory optimization: repeated text columns (names, IDs, descriptions) compress
+    # heavily as categoricals; numeric columns rarely need full float64/int64 range.
+    category_candidates = [
+        "FLEET_TYPE", "FLEET_CUSTOMER_GROUP", "CUSTOMER_COUNTRY_ID", "FOS_CONTRACT_TYPE",
+        "CUSTOMER_NAME", "CUSTOMER_DEPOT", "JOB_TYPE_CODE", "MATERIAL_DESC",
+        "MATERIAL_GROUP_DESC", "MATERIAL_TYPE_DESC", "FOS_MATERIAL_TYPE",
+        "VENDOR_NAME", "VENDOR_ID", "VENDOR_COUNTRY_CODE", "CUST_NAME", "CUST_CNTRY_CD",
+        "MATL_DESC", "MATL_GRP_DESC", "MATL_TYPE_DESC", "JOB_TYPE_CD", "VEND_NAME",
+        "CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED", "MATERIAL_ID_COMBINED",
+    ]
+    # Deliberately NOT categorized: JOB_ID_COMBINED, VEHICLE_ID, LICENCE_PLATE,
+    # LICENCE_PLATE_ID, VEHICLE_REG_NBR. These are near-unique per row (hundreds of
+    # thousands of distinct values), so categorical dtype buys little memory and is
+    # actively dangerous as a groupby key: pandas' default observed=False on a
+    # categorical groupby materializes the full cartesian product of category
+    # levels, which for a 400k+ level column can attempt to allocate an
+    # astronomically large result and crash far worse than the original bug.
+    for col in category_candidates:
+        if col in merged.columns:
+            merged[col] = merged[col].astype("category")
+    for col in merged.select_dtypes(include="float64").columns:
+        merged[col] = pd.to_numeric(merged[col], downcast="float")
+    for col in merged.select_dtypes(include="int64").columns:
+        merged[col] = pd.to_numeric(merged[col], downcast="integer")
 
     return merged
 
@@ -269,7 +321,7 @@ with tab_dashboard:
     st.subheader("Differences by Material ID")
 
     summary = (
-        filtered.groupby("MATERIAL_ID_COMBINED")
+        filtered.groupby("MATERIAL_ID_COMBINED", dropna=False, observed=True)
         .agg(
             PO_NET_PRICE_EURO=("NET_PRICE_EURO", "sum"),
             BILLED_AMT_EURO=("BILLED_AMT_EURO", "sum"),
@@ -372,7 +424,7 @@ with tab_repair:
         fleet_types = sorted([str(x) for x in filtered[fleet_col].dropna().unique().tolist() if str(x).strip() != ""])
         selected_fleet = st.multiselect("Filter by Fleet Type", fleet_types, key="fleet_filter")
 
-        fleet_df = filtered.copy()
+        fleet_df = filtered
         if selected_fleet:
             fleet_df = fleet_df[fleet_df[fleet_col].astype(str).isin(selected_fleet)]
 
@@ -384,28 +436,18 @@ with tab_repair:
             group_cols_fleet.append(mat_desc_fleet)
         group_cols_fleet.append(fleet_col)
 
-        # Aggregate PO and Billing sides separately to avoid many-to-many inflation
-        po_side_cols = [c for c in group_cols_fleet if c in fleet_df.columns]
-        po_dedup_cols = po_side_cols + [c for c in ["PO_QTY", "NET_PRICE_EURO"] if c in fleet_df.columns]
-        bill_dedup_cols = po_side_cols + [c for c in ["BILLED_QTY", "BILLED_AMT_EURO"] if c in fleet_df.columns]
+        # Underlying PO/Billing lines were already pre-aggregated to one row per
+        # (job, material, vehicle) combo in load_and_merge, with TIMES_USED_PO /
+        # TIMES_BILLED / PO_QTY / NET_PRICE_EURO / BILLED_QTY / BILLED_AMT_EURO
+        # already summed there — so this is a single cheap groupby-sum, not a
+        # dataframe copy + multi-column drop_duplicates + two-way merge.
+        fleet_agg_dict = {"TIMES_USED_PO": ("TIMES_USED_PO", "sum"), "TIMES_BILLED": ("TIMES_BILLED", "sum")}
+        if "NET_PRICE_EURO" in fleet_df.columns:
+            fleet_agg_dict["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
+        if "BILLED_AMT_EURO" in fleet_df.columns:
+            fleet_agg_dict["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
 
-        po_agg = fleet_df[fleet_df["PO_QTY"].notna()].drop_duplicates(subset=po_dedup_cols)
-        bill_agg = fleet_df[fleet_df["BILLED_QTY"].notna()].drop_duplicates(subset=bill_dedup_cols)
-
-        po_agg_dict = {"TIMES_USED_PO": ("PO_QTY", "count")}
-        if "NET_PRICE_EURO" in po_agg.columns:
-            po_agg_dict["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
-
-        bill_agg_dict = {"TIMES_BILLED": ("BILLED_QTY", "count")}
-        if "BILLED_AMT_EURO" in bill_agg.columns:
-            bill_agg_dict["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
-
-        po_grouped = po_agg.groupby(group_cols_fleet).agg(**po_agg_dict).reset_index()
-        bill_grouped = bill_agg.groupby(group_cols_fleet).agg(**bill_agg_dict).reset_index()
-
-        fleet_analysis = po_grouped.merge(bill_grouped, on=group_cols_fleet, how="outer")
-        fleet_analysis["TIMES_USED_PO"] = fleet_analysis["TIMES_USED_PO"].fillna(0).astype(int)
-        fleet_analysis["TIMES_BILLED"] = fleet_analysis["TIMES_BILLED"].fillna(0).astype(int)
+        fleet_analysis = fleet_df.groupby(group_cols_fleet, dropna=False, observed=True).agg(**fleet_agg_dict).reset_index()
         if "TOTAL_PO_EURO" in fleet_analysis.columns and "TOTAL_BILLED_EURO" in fleet_analysis.columns:
             fleet_analysis["EURO_DIFF"] = fleet_analysis["TOTAL_PO_EURO"].fillna(0) - fleet_analysis["TOTAL_BILLED_EURO"].fillna(0)
         fleet_analysis = fleet_analysis.sort_values(["TIMES_USED_PO"], ascending=False).reset_index(drop=True)
@@ -418,7 +460,7 @@ with tab_repair:
         with st.container(border=True):
             st.markdown("**Material Usage by Fleet Type**")
             fleet_summary = (
-                fleet_df.groupby([fleet_col, "MATERIAL_ID_COMBINED"])
+                fleet_df.groupby([fleet_col, "MATERIAL_ID_COMBINED"], dropna=False, observed=True)
                 .agg(TOTAL_QTY=("PO_QTY", "sum"))
                 .reset_index()
                 .sort_values("TOTAL_QTY", ascending=False)
@@ -459,26 +501,13 @@ with tab_repair:
     if "CUSTOMER_GROUP" not in filtered.columns:
         st.warning("No CUSTOMER_GROUP column found in the data.")
     else:
-        po_cg_dedup = ["CUSTOMER_GROUP"] + [c for c in ["PO_QTY", "NET_PRICE_EURO"] if c in filtered.columns]
-        bill_cg_dedup = ["CUSTOMER_GROUP"] + [c for c in ["BILLED_QTY", "BILLED_AMT_EURO"] if c in filtered.columns]
+        cg_agg_dict = {"TIMES_USED_PO": ("TIMES_USED_PO", "sum"), "TIMES_BILLED": ("TIMES_BILLED", "sum")}
+        if "NET_PRICE_EURO" in filtered.columns:
+            cg_agg_dict["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
+        if "BILLED_AMT_EURO" in filtered.columns:
+            cg_agg_dict["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
 
-        po_cg_data = filtered[filtered["PO_QTY"].notna()].drop_duplicates(subset=po_cg_dedup)
-        bill_cg_data = filtered[filtered["BILLED_QTY"].notna()].drop_duplicates(subset=bill_cg_dedup)
-
-        po_cg_agg = {"TIMES_USED_PO": ("PO_QTY", "count")}
-        if "NET_PRICE_EURO" in po_cg_data.columns:
-            po_cg_agg["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
-
-        bill_cg_agg = {"TIMES_BILLED": ("BILLED_QTY", "count")}
-        if "BILLED_AMT_EURO" in bill_cg_data.columns:
-            bill_cg_agg["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
-
-        cg_po = po_cg_data.groupby("CUSTOMER_GROUP").agg(**po_cg_agg).reset_index()
-        cg_bill = bill_cg_data.groupby("CUSTOMER_GROUP").agg(**bill_cg_agg).reset_index()
-
-        cg_analysis = cg_po.merge(cg_bill, on="CUSTOMER_GROUP", how="outer")
-        cg_analysis["TIMES_USED_PO"] = cg_analysis["TIMES_USED_PO"].fillna(0).astype(int)
-        cg_analysis["TIMES_BILLED"] = cg_analysis["TIMES_BILLED"].fillna(0).astype(int)
+        cg_analysis = filtered.groupby("CUSTOMER_GROUP", dropna=False, observed=True).agg(**cg_agg_dict).reset_index()
         if "TOTAL_PO_EURO" in cg_analysis.columns and "TOTAL_BILLED_EURO" in cg_analysis.columns:
             cg_analysis["EURO_DIFF"] = cg_analysis["TOTAL_PO_EURO"].fillna(0) - cg_analysis["TOTAL_BILLED_EURO"].fillna(0)
         cg_analysis = cg_analysis.sort_values("TIMES_USED_PO", ascending=False).reset_index(drop=True)
@@ -553,33 +582,13 @@ with tab_repair:
                 if mat_desc_cg:
                     group_cols_cg.append(mat_desc_cg)
 
-                po_dedup = [c for c in group_cols_cg if c in cg_filtered.columns] + [c for c in ["PO_QTY", "NET_PRICE_EURO"] if c in cg_filtered.columns]
-                bill_dedup = [c for c in group_cols_cg if c in cg_filtered.columns] + [c for c in ["BILLED_QTY", "BILLED_AMT_EURO"] if c in cg_filtered.columns]
+                cg_detail_agg = {"TIMES_USED_PO": ("TIMES_USED_PO", "sum"), "TIMES_BILLED": ("TIMES_BILLED", "sum")}
+                if "NET_PRICE_EURO" in cg_filtered.columns:
+                    cg_detail_agg["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
+                if "BILLED_AMT_EURO" in cg_filtered.columns:
+                    cg_detail_agg["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
 
-                po_side = cg_filtered[cg_filtered["PO_QTY"].notna()].drop_duplicates(subset=po_dedup)
-                bill_side = cg_filtered[cg_filtered["BILLED_QTY"].notna()].drop_duplicates(subset=bill_dedup)
-
-                po_agg_dict = {"TIMES_USED_PO": ("PO_QTY", "count")}
-                if "NET_PRICE_EURO" in po_side.columns:
-                    po_agg_dict["TOTAL_PO_EURO"] = ("NET_PRICE_EURO", "sum")
-
-                bill_agg_dict = {"TIMES_BILLED": ("BILLED_QTY", "count")}
-                if "BILLED_AMT_EURO" in bill_side.columns:
-                    bill_agg_dict["TOTAL_BILLED_EURO"] = ("BILLED_AMT_EURO", "sum")
-
-                if not po_side.empty:
-                    cg_po_detail = po_side.groupby(group_cols_cg).agg(**po_agg_dict).reset_index()
-                else:
-                    cg_po_detail = pd.DataFrame(columns=group_cols_cg + list(po_agg_dict.keys()))
-
-                if not bill_side.empty:
-                    cg_bill_detail = bill_side.groupby(group_cols_cg).agg(**bill_agg_dict).reset_index()
-                else:
-                    cg_bill_detail = pd.DataFrame(columns=group_cols_cg + list(bill_agg_dict.keys()))
-
-                cg_detail = cg_po_detail.merge(cg_bill_detail, on=group_cols_cg, how="outer")
-                cg_detail["TIMES_USED_PO"] = cg_detail["TIMES_USED_PO"].fillna(0).astype(int)
-                cg_detail["TIMES_BILLED"] = cg_detail["TIMES_BILLED"].fillna(0).astype(int)
+                cg_detail = cg_filtered.groupby(group_cols_cg, dropna=False, observed=True).agg(**cg_detail_agg).reset_index()
                 if "TOTAL_PO_EURO" in cg_detail.columns and "TOTAL_BILLED_EURO" in cg_detail.columns:
                     cg_detail["EURO_DIFF"] = cg_detail["TOTAL_PO_EURO"].fillna(0) - cg_detail["TOTAL_BILLED_EURO"].fillna(0)
                 cg_detail = cg_detail.sort_values("TIMES_USED_PO", ascending=False).reset_index(drop=True)
@@ -669,7 +678,7 @@ with tab_anomaly:
 
             if not combined_outliers.empty:
                 vendor_mat_counts = (
-                    combined_outliers.groupby([vendor_col_anom, mat_desc_anom])
+                    combined_outliers.groupby([vendor_col_anom, mat_desc_anom], dropna=False, observed=True)
                     .size()
                     .reset_index(name="ANOMALY_COUNT")
                     .sort_values("ANOMALY_COUNT", ascending=False)
@@ -731,25 +740,25 @@ with tab_anomaly:
                     anomaly_parts = []
 
                     if not reg_breakdown.empty:
-                        rb = reg_breakdown.groupby(vendor_col_anom).size().reset_index(name="Count")
+                        rb = reg_breakdown.groupby(vendor_col_anom, dropna=False, observed=True).size().reset_index(name="Count")
                         rb["Anomaly"] = "Regular Breakdown"
                         rb.rename(columns={vendor_col_anom: "Vendor"}, inplace=True)
                         anomaly_parts.append(rb)
 
                     if not reg_job.empty:
-                        rj = reg_job.groupby(vendor_col_anom).size().reset_index(name="Count")
+                        rj = reg_job.groupby(vendor_col_anom, dropna=False, observed=True).size().reset_index(name="Count")
                         rj["Anomaly"] = "Regular Job"
                         rj.rename(columns={vendor_col_anom: "Vendor"}, inplace=True)
                         anomaly_parts.append(rj)
 
                     if not turn_on_rim.empty:
-                        tr = turn_on_rim.groupby(vendor_col_anom).size().reset_index(name="Count")
+                        tr = turn_on_rim.groupby(vendor_col_anom, dropna=False, observed=True).size().reset_index(name="Count")
                         tr["Anomaly"] = "Turn on Rim"
                         tr.rename(columns={vendor_col_anom: "Vendor"}, inplace=True)
                         anomaly_parts.append(tr)
 
                     if not insp_exceed.empty:
-                        ie = insp_exceed.groupby(vendor_col_anom)["INSP_COUNT"].sum().reset_index(name="Count")
+                        ie = insp_exceed.groupby(vendor_col_anom, dropna=False, observed=True)["INSP_COUNT"].sum().reset_index(name="Count")
                         ie["Anomaly"] = "Inspection >2 Same Vehicle"
                         ie.rename(columns={vendor_col_anom: "Vendor"}, inplace=True)
                         anomaly_parts.append(ie)
@@ -773,7 +782,7 @@ with tab_anomaly:
                 st.subheader("Top Offending Vendors")
 
                 vendor_scores = (
-                    combined_outliers.groupby(vendor_col_anom)
+                    combined_outliers.groupby(vendor_col_anom, dropna=False, observed=True)
                     .agg(
                         ANOMALY_COUNT=("JOB_ID_COMBINED", "count"),
                         TOTAL_PRICE_DIFF=("PRICE_DIFF", "sum"),
@@ -816,7 +825,7 @@ with tab_anomaly:
                 st.markdown("Which materials are most commonly involved in anomalous vendor behaviour?")
 
                 mat_scores = (
-                    combined_outliers.groupby([mat_desc_anom, "MATERIAL_ID_COMBINED"])
+                    combined_outliers.groupby([mat_desc_anom, "MATERIAL_ID_COMBINED"], dropna=False, observed=True)
                     .agg(
                         ANOMALY_COUNT=("JOB_ID_COMBINED", "count"),
                         VENDORS_INVOLVED=(vendor_col_anom, "nunique"),
@@ -919,7 +928,7 @@ with tab_anomaly:
             analysis_df["MONTH"] = filtered["PO_POSTING_DATE_COMBINED"].dt.month
 
         vendor_monthly = (
-            analysis_df.groupby([vendor_col_anomaly, "MONTH"])
+            analysis_df.groupby([vendor_col_anomaly, "MONTH"], dropna=False, observed=True)
             .agg(
                 TOTAL_PO_NET_PRICE=("NET_PRICE_EURO", "sum"),
                 TOTAL_BILLED_AMT=("BILLED_AMT_EURO", "sum"),
@@ -1034,11 +1043,11 @@ with tab_anomaly:
             group_cols.append(licence_col_mat)
 
         mat_usage = (
-            filtered.groupby(group_cols)
+            filtered.groupby(group_cols, dropna=False, observed=True)
             .agg(
                 PO_QTY_TOTAL=("PO_QTY", "sum"),
                 BILLED_QTY_TOTAL=("BILLED_QTY", "sum"),
-                PO_LINES=("PO_QTY", "count"),
+                PO_LINES=("TIMES_USED_PO", "sum"),
             )
             .reset_index()
         )
