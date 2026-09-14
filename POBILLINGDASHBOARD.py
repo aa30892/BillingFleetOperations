@@ -348,22 +348,32 @@ with tab_dashboard:
         "TIMES_USED_PO", "TIMES_BILLED",
     ]
     detail_cols = [c for c in detail_cols if c in filtered.columns]
+    detail_df = filtered[detail_cols].copy()
+    detail_df["PRICE_DIFF"] = detail_df["PRICE_DIFF"] * -1
+    detail_df = detail_df.rename(columns={
+        "JOB_ID_COMBINED": "Job ID",
+        "MATERIAL_ID_COMBINED": "Material ID",
+        "CONTRACT_ID_COMBINED": "Contract ID",
+        "CUSTOMER_NAME_COMBINED": "Customer",
+        "PO_POSTING_DATE_COMBINED": "PO Posting Date",
+        "NET_PRICE_EURO": "PO Net Price €",
+        "BILLED_AMT_EURO": "Billed Amt €",
+        "PRICE_DIFF": "Price Diff €",
+        "PO_QTY": "PO Qty",
+        "BILLED_QTY": "Billed Qty",
+        "QTY_DIFF": "Qty Diff",
+        "TIMES_USED_PO": "Times Used PO",
+        "TIMES_BILLED": "Times Billed",
+    })
+
+    def _color_price_diff(val):
+        if val >= 0:
+            return "color: green"
+        return "color: red"
+
+    styled = detail_df.style.applymap(_color_price_diff, subset=["Price Diff €"])
     st.dataframe(
-        filtered[detail_cols].rename(columns={
-            "JOB_ID_COMBINED": "Job ID",
-            "MATERIAL_ID_COMBINED": "Material ID",
-            "CONTRACT_ID_COMBINED": "Contract ID",
-            "CUSTOMER_NAME_COMBINED": "Customer",
-            "PO_POSTING_DATE_COMBINED": "PO Posting Date",
-            "NET_PRICE_EURO": "PO Net Price €",
-            "BILLED_AMT_EURO": "Billed Amt €",
-            "PRICE_DIFF": "Price Diff €",
-            "PO_QTY": "PO Qty",
-            "BILLED_QTY": "Billed Qty",
-            "QTY_DIFF": "Qty Diff",
-            "TIMES_USED_PO": "Times Used PO",
-            "TIMES_BILLED": "Times Billed",
-        }),
+        styled,
         hide_index=True,
         use_container_width=True,
     )
