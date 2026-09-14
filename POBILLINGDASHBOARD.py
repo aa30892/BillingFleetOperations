@@ -76,9 +76,9 @@ def load_data(file_obj):
     df.columns = df.columns.str.upper().str.strip()
 
     if "PO_POSTING_DATE" in df.columns:
-        df["PO_POSTING_DATE"] = pd.to_datetime(df["PO_POSTING_DATE"], errors="coerce").dt.normalize()
+        df["PO_POSTING_DATE"] = pd.to_datetime(df["PO_POSTING_DATE"], errors="coerce").dt.date
     if "BILLING_DT" in df.columns:
-        df["BILLING_DT"] = pd.to_datetime(df["BILLING_DT"], errors="coerce").dt.normalize()
+        df["BILLING_DT"] = pd.to_datetime(df["BILLING_DT"], errors="coerce").dt.date
 
     # --- combined columns (coalesce PO / billing variants) ---
     def _coalesce(df, a, b):
@@ -225,12 +225,14 @@ with st.sidebar:
 
     min_date = merged["PO_POSTING_DATE_COMBINED"].min()
     max_date = merged["PO_POSTING_DATE_COMBINED"].max()
-    if pd.notna(min_date) and pd.notna(max_date):
+    if min_date is not None and max_date is not None:
+        min_d = min_date if not hasattr(min_date, "date") else min_date.date()
+        max_d = max_date if not hasattr(max_date, "date") else max_date.date()
         date_range = st.date_input(
             "PO Posting Date Range",
-            value=(min_date.date(), max_date.date()),
-            min_value=min_date.date(),
-            max_value=max_date.date(),
+            value=(min_d, max_d),
+            min_value=min_d,
+            max_value=max_d,
             key="filter_dates",
         )
     else:
@@ -254,8 +256,8 @@ if selected_material_ids:
     filtered = filtered[filtered["MATERIAL_ID_COMBINED"].astype(str).isin(selected_material_ids)]
 if date_range and len(date_range) == 2:
     filtered = filtered[
-        (filtered["PO_POSTING_DATE_COMBINED"] >= pd.Timestamp(date_range[0]))
-        & (filtered["PO_POSTING_DATE_COMBINED"] <= pd.Timestamp(date_range[1]))
+        (filtered["PO_POSTING_DATE_COMBINED"] >= date_range[0])
+        & (filtered["PO_POSTING_DATE_COMBINED"] <= date_range[1])
     ]
 
 # ------------------------------------------------------------------
@@ -402,21 +404,21 @@ with tab_vendor:
     if vendor_display:
         group_cols_v.append(vendor_display)
 
-    vendor_agg = {"TOTAL_PO_EURO": ("NET_PRICE_EURO", "sum"), "TOTAL_BILLED_EURO": ("BILLED_AMT_EURO", "sum")}
+    vendor_agg = {"TIMES_USED_PO": ("TIMES_USED_PO", "sum"), "TIMES_BILLED": ("TIMES_BILLED", "sum")}
     vendor_summary = (
         vendor_tab_df.groupby(group_cols_v, dropna=False, observed=True)
         .agg(**vendor_agg)
         .reset_index()
     )
-    vendor_summary["EURO_DIFF"] = vendor_summary["TOTAL_PO_EURO"].fillna(0) - vendor_summary["TOTAL_BILLED_EURO"].fillna(0)
-    vendor_summary = vendor_summary.sort_values("EURO_DIFF", ascending=False).reset_index(drop=True)
+    vendor_summary["USAGE_DIFF"] = vendor_summary["TIMES_USED_PO"] - vendor_summary["TIMES_BILLED"]
+    vendor_summary = vendor_summary.sort_values("USAGE_DIFF", ascending=False).reset_index(drop=True)
 
     rename_map = {
         "JOB_ID_COMBINED": "Job ID",
         "MATERIAL_ID_COMBINED": "Material ID",
-        "TOTAL_PO_EURO": "Total PO €",
-        "TOTAL_BILLED_EURO": "Total Billed €",
-        "EURO_DIFF": "Euro Difference",
+        "TIMES_USED_PO": "Times Used PO",
+        "TIMES_BILLED": "Times Billed",
+        "USAGE_DIFF": "Difference",
     }
     if licence_col_v:
         rename_map[licence_col_v] = "Licence Plate"
