@@ -366,11 +366,6 @@ with tab_dashboard:
         "TIMES_BILLED": "Times Billed",
     })
 
-    def _format_price_diff(val):
-        color = "green" if val >= 0 else "red"
-        return f":{color}[{val:,.2f}]"
-
-    detail_df["Price Diff €"] = detail_df["Price Diff €"].apply(_format_price_diff)
     st.dataframe(
         detail_df,
         hide_index=True,
