@@ -371,7 +371,7 @@ with tab_dashboard:
             return "color: green"
         return "color: red"
 
-    styled = detail_df.style.applymap(_color_price_diff, subset=["Price Diff €"])
+    styled = detail_df.style.map(_color_price_diff, subset=["Price Diff €"])
     st.dataframe(
         styled,
         hide_index=True,
@@ -758,3 +758,4 @@ The AI Driver identifies the strongest contributing anomaly dimension:
         file_name="PO_Billing_Anomaly_Report.csv",
         mime="text/csv",
     )
+
