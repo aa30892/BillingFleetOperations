@@ -366,14 +366,13 @@ with tab_dashboard:
         "TIMES_BILLED": "Times Billed",
     })
 
-    def _color_price_diff(val):
-        if val >= 0:
-            return "color: green"
-        return "color: red"
+    def _format_price_diff(val):
+        color = "green" if val >= 0 else "red"
+        return f":{color}[{val:,.2f}]"
 
-    styled = detail_df.style.map(_color_price_diff, subset=["Price Diff €"])
+    detail_df["Price Diff €"] = detail_df["Price Diff €"].apply(_format_price_diff)
     st.dataframe(
-        styled,
+        detail_df,
         hide_index=True,
         use_container_width=True,
     )
@@ -758,4 +757,3 @@ The AI Driver identifies the strongest contributing anomaly dimension:
         file_name="PO_Billing_Anomaly_Report.csv",
         mime="text/csv",
     )
-
