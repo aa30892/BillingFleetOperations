@@ -326,26 +326,6 @@ with tab_dashboard:
     )
     usage_summary["USAGE_DIFF"] = usage_summary["TIMES_USED_PO"] - usage_summary["TIMES_BILLED"]
 
-    col1, col2 = st.columns(2)
-    with col1:
-        with st.container(border=True):
-            st.markdown("**TIMES_USED_PO vs TIMES_BILLED by Material**")
-            chart_usage = (
-                usage_summary[["MATERIAL_ID_COMBINED", "TIMES_USED_PO", "TIMES_BILLED"]]
-                .sort_values("TIMES_USED_PO", ascending=False)
-                .set_index("MATERIAL_ID_COMBINED")
-            )
-            st.bar_chart(chart_usage)
-    with col2:
-        with st.container(border=True):
-            st.markdown("**Usage Difference (PO - Billed)**")
-            chart_diff = (
-                usage_summary[["MATERIAL_ID_COMBINED", "USAGE_DIFF"]]
-                .sort_values("USAGE_DIFF", ascending=False)
-                .set_index("MATERIAL_ID_COMBINED")
-            )
-            st.bar_chart(chart_diff)
-
     st.dataframe(
         usage_summary.rename(columns={
             "MATERIAL_ID_COMBINED": "Material ID",
