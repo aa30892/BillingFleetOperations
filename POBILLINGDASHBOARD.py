@@ -361,12 +361,19 @@ NICE = {
 
 
 def for_display(df):
-    """Rename to friendly headers and show dates without the 00:00:00 time part."""
-    df = df.copy()
-    for c in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[c]):
-            df[c] = df[c].dt.date
+    """Rename to friendly headers."""
     return df.rename(columns=NICE)
+
+
+def table(df):
+    """st.dataframe with friendly headers; dates shown as YYYY-MM-DD (no 00:00:00).
+    Dates stay real datetimes; only the display format changes."""
+    date_cfg = {
+        NICE.get(c, c): st.column_config.DateColumn(format="YYYY-MM-DD")
+        for c in df.columns
+        if pd.api.types.is_datetime64_any_dtype(df[c])
+    }
+    st.dataframe(for_display(df), column_config=date_cfg, hide_index=True, use_container_width=True)
 
 
 def show_table(df, sort_by=None, key=None):
@@ -374,13 +381,13 @@ def show_table(df, sort_by=None, key=None):
         df = df.reindex(df[sort_by].abs().sort_values(ascending=False).index)
     if len(df) > MAX_TABLE_ROWS:
         st.caption(f"Showing top {MAX_TABLE_ROWS:,} of {len(df):,} rows — use the CSV export for all rows.")
-    st.dataframe(df.head(MAX_TABLE_ROWS).pipe(for_display), hide_index=True, use_container_width=True, key=key)
+    table(df.head(MAX_TABLE_ROWS))
 
 
 def csv_export(df, label, file_name, key):
     """Building a CSV of hundreds of thousands of rows is slow, so only do it on request."""
     if st.checkbox(f"Prepare CSV: {label} ({len(df):,} rows)", key=f"prep_{key}"):
-        data = df.pipe(for_display).to_csv(index=False).encode("utf-8")
+        data = df.pipe(for_display).to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8")
         st.download_button(f"Download {label}", data=data, file_name=file_name, mime="text/csv", key=f"dl_{key}")
 
 
@@ -588,12 +595,7 @@ with tab_dashboard:
         with st.container(border=True):
             st.bar_chart(status_summary.set_index("STATUS")["JOB_MATERIALS"], horizontal=True)
     with c2:
-        st.dataframe(
-            status_summary[["STATUS", "JOB_MATERIALS", "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF", "PO_EURO", "BILLED_EURO", "EURO_DIFF"]]
-            .pipe(for_display),
-            hide_index=True,
-            use_container_width=True,
-        )
+        table(status_summary[["STATUS", "JOB_MATERIALS", "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF", "PO_EURO", "BILLED_EURO", "EURO_DIFF"]])
 
     st.subheader("By month")
     month_basis = st.radio("Month of", ["Job Date", "PO Posting Date"], horizontal=True, key="month_basis")
@@ -689,14 +691,12 @@ with tab_jm:
         if lines.empty:
             st.info("No PO lines for that Job ID within the current filters.")
         else:
-            st.dataframe(
+            table(
                 lines[[
                     "JOB_ID_COMBINED", "JOB_DATE", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "VEHICLE_C", "LICENCE_PLATE_C",
                     "PO_POSTING_DATE_COMBINED", "PO_QTY", "NET_PRICE_EURO", "BILL_LINES", "BILLED_QTY",
                     "BILLED_AMT_EURO", "FIRST_BILLING_DATE", "LAST_BILLING_DATE", "VENDOR_C", "SOURCE_FILE",
-                ]].pipe(for_display),
-                hide_index=True,
-                use_container_width=True,
+                ]]
             )
 
 # ========================== VENDOR ==========================
@@ -737,11 +737,7 @@ with tab_contract:
     jm_fleet = jm[jm["FLEET_TYPE_C"].astype(str).isin(sel_fleet)] if sel_fleet else jm
 
     fleet_summary = summarize(jm_fleet, "FLEET_TYPE_C")
-    st.dataframe(
-        fleet_summary.sort_values("TIMES_USED_PO", ascending=False).pipe(for_display),
-        hide_index=True,
-        use_container_width=True,
-    )
+    table(fleet_summary.sort_values("TIMES_USED_PO", ascending=False))
 
     st.subheader("Contract Analysis — PO vs Billing")
     contract_summary = summarize(jm_fleet, ["CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED", "FLEET_TYPE_C"])
@@ -888,7 +884,7 @@ combinations of values (+5).
         "RISK_LEVEL", "RISK_SCORE", "ANOMALY_EXPLANATION",
     ]
     ranked = anomaly_df.sort_values(["RISK_SCORE", "AI_SCORE"], ascending=[False, True])
-    st.dataframe(ranked[display_cols].head(200).pipe(for_display), hide_index=True, use_container_width=True)
+    table(ranked[display_cols].head(200))
 
     flagged = ranked[ranked["RISK_LEVEL"] != "LOW"]
     csv_export(flagged, "Anomaly Report (High + Medium risk)", "PO_Billing_Anomaly_Report.csv", "anomaly")
