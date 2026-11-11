@@ -33,6 +33,11 @@ st.title("PO vs Billing Comparison — Quarterly")
 MAX_TABLE_ROWS = 5_000  # rows rendered in on-screen tables (full data via CSV export)
 PO_KEYS = ["JOB_NOTIFICATION_ID", "MATERIAL_ID", "VEHICLE_ID", "PO_POSTING_DATE"]
 JM_KEYS = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]
+# Used as Job Date when present in the file; otherwise Job Date = earliest PO posting date of the Job ID
+JOB_DATE_CANDIDATES = [
+    "JOB_DATE", "JOB_DT", "JOB_CREATION_DATE", "JOB_CREATED_DATE", "JOB_CREATE_DT", "JOB_START_DATE",
+    "JOB_NOTIFICATION_DATE", "JOB_NOTIFICATION_DT", "NOTIFICATION_DATE", "NOTIFICATION_DT", "NOTIF_DATE",
+]
 STATUS_ORDER = ["Not billed", "Under-billed", "Over-billed", "Billed without PO", "Matched"]
 
 
@@ -114,7 +119,7 @@ def read_source(name, path, upload):
 def prepare_frame(df, source_name):
     df.columns = df.columns.str.upper().str.strip()
 
-    for c in ["PO_POSTING_DATE", "BILLING_DT", "FIRST_BILLING_DT", "LAST_BILLING_DT"]:
+    for c in ["PO_POSTING_DATE", "BILLING_DT", "FIRST_BILLING_DT", "LAST_BILLING_DT"] + JOB_DATE_CANDIDATES:
         if c in df.columns:
             d = pd.to_datetime(df[c], errors="coerce")
             if isinstance(d.dtype, pd.DatetimeTZDtype):
@@ -152,6 +157,8 @@ def prepare_frame(df, source_name):
         bill_first if bill_first is not None else nat
     )
     out["FIRST_BILLING_DATE"] = bill_first if bill_first is not None else nat
+    job_date = _coalesce(df, JOB_DATE_CANDIDATES)
+    out["JOB_DATE"] = job_date if job_date is not None else nat  # completed in load_sources
     out["LAST_BILLING_DATE"] = bill_last if bill_last is not None else nat
     q = out["PO_POSTING_DATE_COMBINED"].dt.to_period("Q").astype(str)
     out["QUARTER"] = q.str.replace(r"^(\d{4})Q(\d)$", r"\1-Q\2", regex=True).replace("NaT", "Unknown")
@@ -196,15 +203,33 @@ def load_sources(_sources, cache_key):
         dropped = before - len(df)
     df = df.drop(columns=key_cols)
 
+    # --- Job Date: file column if available, else earliest PO posting date of the Job ID ---
+    rows_with_file_job_date = int(df["JOB_DATE"].notna().sum())
+    has_job = df["JOB_ID_COMBINED"] != ""
+    by_job = df["JOB_ID_COMBINED"].where(has_job)
+    jd = df["JOB_DATE"]
+    if rows_with_file_job_date:
+        jd = jd.fillna(df["JOB_DATE"].groupby(by_job).transform("min"))
+    jd = jd.fillna(df["PO_POSTING_DATE_COMBINED"].groupby(by_job).transform("min"))
+    df["JOB_DATE"] = jd.fillna(df["PO_POSTING_DATE_COMBINED"])
+    df["JOB_MONTH"] = df["JOB_DATE"].dt.strftime("%Y-%m").fillna("Unknown")
+    if rows_with_file_job_date == len(df):
+        job_date_note = "Job Date taken from the file."
+    elif rows_with_file_job_date:
+        job_date_note = (f"Job Date from the file for {rows_with_file_job_date:,} of {len(df):,} lines; "
+                         "the rest use the Job ID's earliest PO posting date.")
+    else:
+        job_date_note = "No job date column in the file — Job Date = earliest PO posting date of the Job ID."
+
     cat_cols = [
         "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED", "CONTRACT_ID_COMBINED",
         "CUSTOMER_NAME_COMBINED", "CUSTOMER_GROUP", "VENDOR_C", "MATERIAL_DESC_C",
         "FLEET_TYPE_C", "JOB_TYPE_C", "LICENCE_PLATE_C", "VEHICLE_C", "QUARTER",
-        "PO_MONTH", "SOURCE_FILE",
+        "PO_MONTH", "JOB_MONTH", "SOURCE_FILE",
     ]
     for c in cat_cols:
         df[c] = df[c].astype("category")
-    return df, dropped
+    return df, dropped, job_date_note
 
 
 @st.cache_data(show_spinner=False, max_entries=3)
@@ -232,7 +257,9 @@ def job_material_base(_df, cache_key):
         BILLED_QTY=("BILLED_QTY", "sum"),
         PO_EURO=("NET_PRICE_EURO", "sum"),
         BILLED_EURO=("BILLED_AMT_EURO", "sum"),
+        JOB_DATE=("JOB_DATE", "min"),
         FIRST_PO_DATE=("PO_POSTING_DATE_COMBINED", "min"),
+        FIRST_BILLING_DATE=("FIRST_BILLING_DATE", "min"),
         LAST_BILLING_DATE=("LAST_BILLING_DATE", "max"),
     ).reset_index()
     attr_cols = [
@@ -242,6 +269,7 @@ def job_material_base(_df, cache_key):
     attrs = _df[JM_KEYS + attr_cols].drop_duplicates(subset=JM_KEYS)
     agg = agg.merge(attrs, on=JM_KEYS, how="left")
     agg["EURO_DIFF"] = agg["PO_EURO"] - agg["BILLED_EURO"]  # PO − Billed
+    agg["DAYS_JOB_TO_BILL"] = (agg["FIRST_BILLING_DATE"] - agg["JOB_DATE"]).dt.days.astype("Int64")
     return agg
 
 
@@ -303,6 +331,9 @@ NICE = {
     "VEHICLE_C": "Vehicle ID",
     "QUARTER": "Quarter",
     "PO_MONTH": "PO Month",
+    "JOB_MONTH": "Job Month",
+    "JOB_DATE": "Job Date",
+    "DAYS_JOB_TO_BILL": "Days Job → First Billing",
     "STATUS": "Status",
     "TIMES_USED_PO": "Times Used PO",
     "TIMES_BILLED": "Times Billed",
@@ -399,7 +430,7 @@ if not sources:
 
 data_key = tuple(sorted(key_parts, key=str))
 try:
-    merged, n_dupes = load_sources(sources, data_key)
+    merged, n_dupes, job_date_note = load_sources(sources, data_key)
 except Exception as e:
     st.error(f"Error loading file(s): {e}")
     st.stop()
@@ -449,6 +480,18 @@ with st.sidebar:
             key="filter_dates",
         )
 
+    job_min, job_max = merged["JOB_DATE"].min(), merged["JOB_DATE"].max()
+    job_range = None
+    if pd.notna(job_min) and pd.notna(job_max):
+        job_range = st.date_input(
+            "Job Date Range",
+            value=(job_min.date(), job_max.date()),
+            min_value=job_min.date(),
+            max_value=job_max.date(),
+            key="filter_job_dates",
+            help=job_date_note,
+        )
+
 # ------------------------------------------------------------------
 # APPLY FILTERS
 # ------------------------------------------------------------------
@@ -472,10 +515,17 @@ if date_range and len(date_range) == 2:
         mask &= merged["PO_POSTING_DATE_COMBINED"].between(d0, d1)
         date_key = (str(d0.date()), str(d1.date()))
 
+job_date_key = None
+if job_range and len(job_range) == 2:
+    j0, j1 = pd.Timestamp(job_range[0]), pd.Timestamp(job_range[1])
+    if j0 > job_min or j1 < job_max:
+        mask &= merged["JOB_DATE"].between(j0, j1)
+        job_date_key = (str(j0.date()), str(j1.date()))
+
 filtered = merged[mask] if not mask.all() else merged
 filter_key = (
     data_key, tuple(sel_quarters), tuple(sel_contracts), tuple(sel_groups), tuple(sel_customers),
-    tuple(sel_vendors), tuple(sel_materials), tuple(sel_jobs), date_key,
+    tuple(sel_vendors), tuple(sel_materials), tuple(sel_jobs), date_key, job_date_key,
 )
 
 if filtered.empty:
@@ -495,7 +545,7 @@ tab_dashboard, tab_jm, tab_vendor, tab_contract, tab_anomaly = st.tabs(
 # ========================== DASHBOARD ==========================
 with tab_dashboard:
     quarters_txt = ", ".join(str(q) for q in filtered["QUARTER"].unique())
-    st.caption(f"Quarter(s) in view: {quarters_txt} · usage counted in **{unit_word}**")
+    st.caption(f"Quarter(s) in view: {quarters_txt} · usage counted in **{unit_word}** · {job_date_note}")
 
     total_po = filtered["NET_PRICE_EURO"].sum()
     total_billed = filtered["BILLED_AMT_EURO"].sum()
@@ -536,10 +586,12 @@ with tab_dashboard:
             use_container_width=True,
         )
 
-    st.subheader("By PO month")
+    st.subheader("By month")
+    month_basis = st.radio("Month of", ["Job Date", "PO Posting Date"], horizontal=True, key="month_basis")
+    month_col = "JOB_MONTH" if month_basis == "Job Date" else "PO_MONTH"
     monthly = (
         filtered.assign(_U=filtered[USED_COL].fillna(0), _B=filtered[BILLED_COL].fillna(0))
-        .groupby("PO_MONTH", observed=True)
+        .groupby(month_col, observed=True)
         .agg(TIMES_USED_PO=("_U", "sum"), TIMES_BILLED=("_B", "sum"))
     )
     st.bar_chart(monthly.rename(columns=NICE), stack=False)
@@ -595,11 +647,11 @@ with tab_jm:
         st.metric("€ Diff (PO − Billed)", f"{jm_view['EURO_DIFF'].sum():,.2f}", border=True)
 
     jm_cols = [
-        "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "STATUS",
+        "JOB_ID_COMBINED", "JOB_DATE", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "STATUS",
         "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF",
         "PO_LINES", "BILL_LINES", "PO_QTY", "BILLED_QTY",
         "PO_EURO", "BILLED_EURO", "EURO_DIFF",
-        "FIRST_PO_DATE", "LAST_BILLING_DATE", "QUARTER",
+        "FIRST_PO_DATE", "FIRST_BILLING_DATE", "LAST_BILLING_DATE", "DAYS_JOB_TO_BILL", "QUARTER",
         "VENDOR_C", "CUSTOMER_NAME_COMBINED", "CONTRACT_ID_COMBINED", "FLEET_TYPE_C", "LICENCE_PLATE_C",
     ]
     show_table(jm_view[jm_cols], sort_by="USAGE_DIFF", key="jm_table")
@@ -616,7 +668,7 @@ with tab_jm:
         else:
             st.dataframe(
                 lines[[
-                    "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "VEHICLE_C", "LICENCE_PLATE_C",
+                    "JOB_ID_COMBINED", "JOB_DATE", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "VEHICLE_C", "LICENCE_PLATE_C",
                     "PO_POSTING_DATE_COMBINED", "PO_QTY", "NET_PRICE_EURO", "BILL_LINES", "BILLED_QTY",
                     "BILLED_AMT_EURO", "FIRST_BILLING_DATE", "LAST_BILLING_DATE", "VENDOR_C", "SOURCE_FILE",
                 ]].rename(columns=NICE),
@@ -648,7 +700,7 @@ with tab_vendor:
         vd = jm[jm["VENDOR_C"].astype(str).isin(sel_tab_vendors)]
         show_table(
             vd[[
-                "JOB_ID_COMBINED", "LICENCE_PLATE_C", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "FLEET_TYPE_C",
+                "JOB_ID_COMBINED", "JOB_DATE", "LICENCE_PLATE_C", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "FLEET_TYPE_C",
                 "VENDOR_C", "STATUS", "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF", "PO_EURO", "BILLED_EURO",
             ]],
             sort_by="USAGE_DIFF",
@@ -807,7 +859,7 @@ combinations of values (+5).
 
     st.subheader("Top Anomalies")
     display_cols = [
-        "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "CUSTOMER_NAME_COMBINED",
+        "JOB_ID_COMBINED", "JOB_DATE", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "CUSTOMER_NAME_COMBINED",
         "CONTRACT_ID_COMBINED", "VENDOR_C", "STATUS", "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF",
         "PO_EURO", "BILLED_EURO", "EURO_DIFF", "RULE_COUNT", "MAX_Z_SCORE", "AI_SCORE", "AI_DRIVER",
         "RISK_LEVEL", "RISK_SCORE", "ANOMALY_EXPLANATION",
