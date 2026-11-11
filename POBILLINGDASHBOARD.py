@@ -614,6 +614,20 @@ with tab_dashboard:
         key="mat_table",
     )
 
+    st.subheader("Detail Table — Job × Material with Contract, Customer and Job Date")
+    detail_cols = [
+        "JOB_ID_COMBINED", "JOB_DATE", "CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED",
+        "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "STATUS",
+        "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF",
+        "PO_EURO", "BILLED_EURO", "EURO_DIFF",
+    ]
+    dash_status = st.multiselect(
+        "Status", STATUS_ORDER, default=[s for s in STATUS_ORDER if s != "Matched"], key="dash_status"
+    )
+    dash_detail = jm[jm["STATUS"].isin(dash_status)] if dash_status else jm
+    show_table(dash_detail[detail_cols], sort_by="USAGE_DIFF", key="dash_detail")
+    csv_export(dash_detail[detail_cols], "Dashboard detail", "PO_Billing_Detail.csv", "dash_detail")
+
 # ========================== JOB × MATERIAL ==========================
 with tab_jm:
     st.subheader("Job ID × Material ID — Times Used in PO vs Times Billed")
