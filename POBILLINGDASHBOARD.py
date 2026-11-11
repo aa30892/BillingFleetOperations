@@ -360,18 +360,27 @@ NICE = {
 }
 
 
+def for_display(df):
+    """Rename to friendly headers and show dates without the 00:00:00 time part."""
+    df = df.copy()
+    for c in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[c]):
+            df[c] = df[c].dt.date
+    return df.rename(columns=NICE)
+
+
 def show_table(df, sort_by=None, key=None):
     if sort_by is not None and sort_by in df.columns:
         df = df.reindex(df[sort_by].abs().sort_values(ascending=False).index)
     if len(df) > MAX_TABLE_ROWS:
         st.caption(f"Showing top {MAX_TABLE_ROWS:,} of {len(df):,} rows — use the CSV export for all rows.")
-    st.dataframe(df.head(MAX_TABLE_ROWS).rename(columns=NICE), hide_index=True, use_container_width=True, key=key)
+    st.dataframe(df.head(MAX_TABLE_ROWS).pipe(for_display), hide_index=True, use_container_width=True, key=key)
 
 
 def csv_export(df, label, file_name, key):
     """Building a CSV of hundreds of thousands of rows is slow, so only do it on request."""
     if st.checkbox(f"Prepare CSV: {label} ({len(df):,} rows)", key=f"prep_{key}"):
-        data = df.rename(columns=NICE).to_csv(index=False).encode("utf-8")
+        data = df.pipe(for_display).to_csv(index=False).encode("utf-8")
         st.download_button(f"Download {label}", data=data, file_name=file_name, mime="text/csv", key=f"dl_{key}")
 
 
@@ -581,7 +590,7 @@ with tab_dashboard:
     with c2:
         st.dataframe(
             status_summary[["STATUS", "JOB_MATERIALS", "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF", "PO_EURO", "BILLED_EURO", "EURO_DIFF"]]
-            .rename(columns=NICE),
+            .pipe(for_display),
             hide_index=True,
             use_container_width=True,
         )
@@ -685,7 +694,7 @@ with tab_jm:
                     "JOB_ID_COMBINED", "JOB_DATE", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "VEHICLE_C", "LICENCE_PLATE_C",
                     "PO_POSTING_DATE_COMBINED", "PO_QTY", "NET_PRICE_EURO", "BILL_LINES", "BILLED_QTY",
                     "BILLED_AMT_EURO", "FIRST_BILLING_DATE", "LAST_BILLING_DATE", "VENDOR_C", "SOURCE_FILE",
-                ]].rename(columns=NICE),
+                ]].pipe(for_display),
                 hide_index=True,
                 use_container_width=True,
             )
@@ -729,7 +738,7 @@ with tab_contract:
 
     fleet_summary = summarize(jm_fleet, "FLEET_TYPE_C")
     st.dataframe(
-        fleet_summary.sort_values("TIMES_USED_PO", ascending=False).rename(columns=NICE),
+        fleet_summary.sort_values("TIMES_USED_PO", ascending=False).pipe(for_display),
         hide_index=True,
         use_container_width=True,
     )
@@ -879,7 +888,7 @@ combinations of values (+5).
         "RISK_LEVEL", "RISK_SCORE", "ANOMALY_EXPLANATION",
     ]
     ranked = anomaly_df.sort_values(["RISK_SCORE", "AI_SCORE"], ascending=[False, True])
-    st.dataframe(ranked[display_cols].head(200).rename(columns=NICE), hide_index=True, use_container_width=True)
+    st.dataframe(ranked[display_cols].head(200).pipe(for_display), hide_index=True, use_container_width=True)
 
     flagged = ranked[ranked["RISK_LEVEL"] != "LOW"]
     csv_export(flagged, "Anomaly Report (High + Medium risk)", "PO_Billing_Anomaly_Report.csv", "anomaly")
