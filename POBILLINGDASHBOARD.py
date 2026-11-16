@@ -25,7 +25,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(page_title="PO vs Billing Dashboard", layout="wide")
 st.title("PO vs Billing Comparison — Quarterly")
@@ -354,7 +353,7 @@ NICE = {
     "CUSTOMER_GROUP": "Customer Group",
     "VENDOR_C": "Vendor",
     "FLEET_TYPE_C": "Fleet Type",
-    "JOB_TYPE_C": "Job Type",
+    "JOB_TYPE_C": "Job Type Code",
     "LICENCE_PLATE_C": "Licence Plate",
     "VEHICLE_C": "Vehicle ID",
     "QUARTER": "Quarter",
@@ -655,9 +654,9 @@ with tab_dashboard:
         key="mat_table",
     )
 
-    st.subheader("Detail Table — Job × Material with Contract, Customer and Job Date")
+    st.subheader("Detail Table — Job × Material with Job Type, Contract, Customer and Job Date")
     detail_cols = [
-        "JOB_ID_COMBINED", "JOB_DATE", "CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED",
+        "JOB_ID_COMBINED", "JOB_DATE", "JOB_TYPE_C", "CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED",
         "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "STATUS",
         "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF",
         "PO_EURO", "BILLED_EURO", "EURO_DIFF",
@@ -779,142 +778,391 @@ with tab_contract:
     show_table(cg_summary, sort_by="USAGE_DIFF", key="cg_table")
 
 # ========================== AI ANOMALY ANALYSIS ==========================
-@st.cache_data(show_spinner="Running anomaly detection...", max_entries=4)
-def run_anomaly(_jm, cache_key):
+# Every Job × Material is run through a set of plain-language checks. Each finding gets a
+# "€ at stake" amount and a one-line explanation; findings are ranked by money at stake.
+CHECKS = {
+    "Not billed": "PO line with a price, for a contract and material that are normally billed per line, "
+                  "with no billing after the grace period.",
+    "Partially billed": "Some of the PO quantity was billed, but not all of it.",
+    "Billed more than PO qty": "More units were billed than the PO contains (or billed with no PO quantity).",
+    "Billed price ≠ PO price": "The billed price per unit differs from the PO price per unit by more than the tolerance.",
+    "Unusual PO price": "The PO price per unit is far above what this material normally costs on other jobs "
+                        "(only materials with a stable price).",
+    "Unusual quantity": "The PO quantity is far above what is normally used for this material on one job.",
+    "Unusual pattern (AI)": "A machine-learning model (Isolation Forest) found this combination of price, "
+                            "quantity, billing share and billing delay rare compared with similar jobs.",
+}
+CHECK_ORDER = list(CHECKS)
+ACTIONS = {
+    "Not billed": "Check why it was not billed / raise the invoice",
+    "Partially billed": "Check missing units on the invoice",
+    "Billed more than PO qty": "Check for double billing or a missing PO update",
+    "Billed price ≠ PO price": "Check the price agreement for this material",
+    "Unusual PO price": "Check the PO price (possible input error)",
+    "Unusual quantity": "Check the PO quantity (possible input error)",
+    "Unusual pattern (AI)": "Review the job; the explanation shows what is unusual",
+}
+
+
+@st.cache_data(show_spinner="Preparing reference values...", max_entries=6)
+def reference_stats(_merged, cache_key, line_billed_pct):
+    """Peer values computed on ALL loaded data (not affected by filters)."""
+    m = _merged
+    has_bill = m["BILL_LINES"] > 0
+    contract_rate = has_bill.groupby(m["CONTRACT_ID_COMBINED"], observed=True).mean().rename(index=str)
+    ok = (m["PO_QTY"] > 0) & (m["NET_PRICE_EURO"] > 0)
+    unit = (m["NET_PRICE_EURO"] / m["PO_QTY"]).where(ok)
+    on_line_contracts = m["CONTRACT_ID_COMBINED"].astype(str).map(contract_rate).fillna(0) * 100 >= line_billed_pct
+    by_mat = pd.DataFrame({
+        "MAT": m["MATERIAL_ID_COMBINED"].astype(str), "UNIT": unit, "QTY": m["PO_QTY"].where(m["PO_QTY"] > 0),
+        "BILLED_ON_LINE_CONTRACTS": has_bill.where(on_line_contracts).astype(float),
+    })
+    g = by_mat.groupby("MAT")
+    mat = g.agg(MED_UNIT=("UNIT", "median"), MED_QTY=("QTY", "median"), N=("UNIT", "count"),
+                BILL_RATE=("BILLED_ON_LINE_CONTRACTS", "mean"))
+    mat["P25"] = g["UNIT"].quantile(0.25)
+    mat["P75"] = g["UNIT"].quantile(0.75)
+    # stable price = middle half of prices within a factor 3, and a typical price of at least €1
+    mat["STABLE_PRICE"] = (mat["P75"] / mat["P25"] <= 3) & (mat["MED_UNIT"] >= 1)
+    as_of = m["LAST_BILLING_DATE"].max()
+    if pd.isna(as_of):
+        as_of = m["PO_POSTING_DATE_COMBINED"].max()
+    return contract_rate, mat, as_of
+
+
+def _eur(x):
+    return "€" + pd.Series(x).abs().map("{:,.0f}".format)
+
+
+def _times(x):
+    """5.2 -> '5.2×', 0.004 -> '0.004×' (keeps small ratios readable)."""
+    return pd.Series(x).map(lambda v: "?" if pd.isna(v) else (f"{v:,.1f}×" if v >= 0.1 else f"{v:.2g}×"))
+
+
+@st.cache_data(show_spinner="Running anomaly checks...", max_entries=4)
+def run_anomaly(_jm, _ref, cache_key, settings):
+    grace_days, tol, min_eur, line_billed_pct, include_lump, hi_eur, med_eur, ai_share = settings
+    contract_rate, mat, as_of = _ref
     a = _jm.copy()
-    used, billed = a["TIMES_USED_PO"], a["TIMES_BILLED"]
-    both = (used > 0) & (billed > 0)
+    po_q, b_q = a["PO_QTY"].fillna(0), a["BILLED_QTY"].fillna(0)
+    po_e, b_e = a["PO_EURO"].fillna(0), a["BILLED_EURO"].fillna(0)
+    po_unit = (po_e / po_q).where((po_q > 0) & (po_e > 0))
+    b_unit = (b_e / b_q).where(b_q > 0)
+    mat_key = a["MATERIAL_ID_COMBINED"].astype(str)
+    med_unit = mat_key.map(mat["MED_UNIT"])
+    med_qty = mat_key.map(mat["MED_QTY"])
+    n_peers = mat_key.map(mat["N"]).fillna(0)
+    a["CONTRACT_BILLED_PCT"] = (a["CONTRACT_ID_COMBINED"].astype(str).map(contract_rate).fillna(0) * 100).round(1)
+    a["MATERIAL_BILLED_PCT"] = (mat_key.map(mat["BILL_RATE"]).fillna(0) * 100).round(1)
+    stable_price = mat_key.map(mat["STABLE_PRICE"]).fillna(False).astype(bool)
+    a["DAYS_SINCE_JOB"] = (as_of - a["JOB_DATE"]).dt.days
+    unbilled = (b_q <= 0) & (b_e == 0)
 
-    # ---- rule based (Job × Material level) ----
-    a["RULE_NO_BILLING"] = a["STATUS"] == "Not billed"
-    a["RULE_NO_PO"] = a["STATUS"] == "Billed without PO"
-    usage_pct = np.where(used > 0, a["USAGE_DIFF"] / used.where(used > 0) * 100, 0)
-    euro_pct = np.where(a["PO_EURO"] != 0, a["EURO_DIFF"] / a["PO_EURO"].where(a["PO_EURO"] != 0) * 100, 0)
-    a["USAGE_DIFF_PCT"] = np.round(usage_pct, 1)
-    a["EURO_DIFF_PCT"] = np.round(euro_pct, 1)
-    # % rules only when both PO and billing exist — otherwise they just duplicate the missing-side rules
-    a["RULE_HIGH_USAGE_DIFF"] = both & (np.abs(usage_pct) > 20)
-    a["RULE_HIGH_EURO_DIFF"] = both & (np.abs(euro_pct) > 20)
-    rule_cols = ["RULE_NO_BILLING", "RULE_NO_PO", "RULE_HIGH_USAGE_DIFF", "RULE_HIGH_EURO_DIFF"]
-    a["RULE_COUNT"] = a[rule_cols].sum(axis=1)
+    flags, euros = {}, {}
 
-    # ---- statistical outliers ----
-    stat_cols = ["USAGE_DIFF", "EURO_DIFF", "PO_EURO", "BILLED_EURO", "TIMES_USED_PO", "TIMES_BILLED"]
-    z_data = a[stat_cols].fillna(0).replace([np.inf, -np.inf], 0)
-    z = ((z_data - z_data.mean()) / z_data.std(ddof=0).replace(0, np.nan)).fillna(0)
-    a["MAX_Z_SCORE"] = z.abs().max(axis=1).round(2)
-    a["STAT_OUTLIER"] = a["MAX_Z_SCORE"] > 3
-    a["TOP_STAT_DRIVER"] = z.abs().idxmax(axis=1)
-
-    # ---- isolation forest ----
-    ml_ok = len(a) >= 20
-    if ml_ok:
-        X = z_data.to_numpy()
-        X_scaled = StandardScaler().fit_transform(X)
-        model = IsolationForest(contamination=0.03, random_state=42, n_estimators=200, n_jobs=-1)
-        fit_rows = X_scaled
-        if len(X_scaled) > 200_000:  # IF subsamples per tree anyway; keeps fit time bounded
-            rng = np.random.default_rng(42)
-            fit_rows = X_scaled[rng.choice(len(X_scaled), 200_000, replace=False)]
-        model.fit(fit_rows)
-        a["AI_SCORE"] = model.decision_function(X_scaled).round(4)
-        a["AI_FLAG"] = model.predict(X_scaled) == -1
-        a["AI_DRIVER"] = np.array(stat_cols)[np.abs(X_scaled).argmax(axis=1)]
+    # 1. Not billed
+    line_billed = (a["CONTRACT_BILLED_PCT"] >= line_billed_pct) & (a["MATERIAL_BILLED_PCT"] >= line_billed_pct)
+    f = unbilled & (po_q > 0) & (po_e >= min_eur) & (a["DAYS_SINCE_JOB"] > grace_days)
+    excluded = f & ~line_billed
+    excluded_info = (int(excluded.sum()), float(po_e[excluded].sum()))
+    if not include_lump:
+        f &= line_billed
     else:
-        a["AI_SCORE"] = 0.0
-        a["AI_FLAG"] = False
-        a["AI_DRIVER"] = "N/A"
+        excluded_info = (0, 0.0)
+    flags["Not billed"] = f
+    euros["Not billed"] = po_e.where(f, 0)
 
-    # ---- risk score ----
-    a["RISK_SCORE"] = a["RULE_COUNT"] * 3 + a["STAT_OUTLIER"].astype(int) * 2 + a["AI_FLAG"].astype(int) * 5
-    a["RISK_LEVEL"] = np.select([a["RISK_SCORE"] >= 8, a["RISK_SCORE"] >= 4], ["HIGH", "MEDIUM"], default="LOW")
+    # 2. Partially billed
+    missing = (po_q - b_q).clip(lower=0)
+    miss_eur = (po_e * missing / po_q.where(po_q > 0)).fillna(0)
+    f = (b_q > 0) & (b_q < po_q) & (miss_eur >= min_eur)
+    flags["Partially billed"] = f
+    euros["Partially billed"] = miss_eur.where(f, 0)
 
-    # ---- explanation (vectorised) ----
+    # 3. Billed more than PO quantity
+    extra = (b_q - po_q).clip(lower=0)
+    extra_eur = (b_e * extra / b_q.where(b_q > 0)).fillna(0)
+    f = (b_q > po_q) & (extra_eur >= min_eur)
+    flags["Billed more than PO qty"] = f
+    euros["Billed more than PO qty"] = extra_eur.where(f, 0)
+
+    # 4. Billed price per unit differs from PO price per unit
+    price_ratio = b_unit / po_unit
+    price_eur = ((b_unit - po_unit) * b_q).fillna(0)
+    f = price_ratio.notna() & ((price_ratio - 1).abs() > tol / 100) & (price_eur.abs() >= min_eur)
+    flags["Billed price ≠ PO price"] = f
+    euros["Billed price ≠ PO price"] = price_eur.abs().where(f, 0)
+
+    # 5. Unusual PO price vs the same material on other jobs
+    unit_x = po_unit / med_unit
+    excess = ((po_unit - med_unit) * po_q).fillna(0)
+    f = (n_peers >= 10) & stable_price & (unit_x >= 5) & (excess >= max(min_eur, 100))
+    flags["Unusual PO price"] = f
+    euros["Unusual PO price"] = excess.where(f, 0)
+
+    # 6. Unusual quantity vs the same material on other jobs
+    qty_x = po_q / med_qty
+    qty_eur = ((po_q - med_qty) * po_unit).fillna(0)
+    f = (n_peers >= 10) & (qty_x >= 10) & (po_q >= 10)
+    flags["Unusual quantity"] = f
+    euros["Unusual quantity"] = qty_eur.clip(lower=0).where(f, 0)
+
+    # 7. AI: Isolation Forest on peer-relative, explainable features
+    feats = pd.DataFrame(index=a.index)
+    feats["price_vs_usual"] = np.log(unit_x.clip(1e-3, 1e4))
+    feats["qty_vs_usual"] = np.log(qty_x.clip(1e-3, 1e4))
+    feats["billed_share"] = (b_q / po_q.where(po_q > 0)).clip(0, 5)
+    feats["billed_price_vs_po"] = np.log(price_ratio.clip(1e-3, 1e3))
+    feats["days_to_bill"] = (a["FIRST_BILLING_DATE"] - a["JOB_DATE"]).dt.days.clip(lower=0)
+    usable = (po_q > 0) & (po_e > 0) & feats["price_vs_usual"].notna()
+    a["AI_FLAG"] = False
+    a["AI_SCORE"] = np.nan
+    ai_text = pd.Series("", index=a.index)
+    if usable.sum() >= 50:
+        X = feats[usable].copy()
+        X["days_to_bill"] = X["days_to_bill"].fillna(-30)  # not billed → separate value
+        X = X.fillna(0)
+        med, iqr = X.median(), (X.quantile(0.75) - X.quantile(0.25)).replace(0, 1)
+        Z = (X - med) / iqr  # robust scaling → also used to explain the result
+        model = IsolationForest(n_estimators=200, contamination=ai_share / 100, random_state=42, n_jobs=-1)
+        fit = Z.sample(min(len(Z), 200_000), random_state=42)
+        model.fit(fit.to_numpy())
+        score = model.decision_function(Z.to_numpy())
+        flag = model.predict(Z.to_numpy()) == -1
+        a.loc[usable, "AI_SCORE"] = np.round(-score, 4)  # higher = more unusual
+        a.loc[usable, "AI_FLAG"] = flag
+        top = Z.abs().idxmax(axis=1)
+        idx = Z.index
+        words = {
+            "price_vs_usual": "PO price " + _times(unit_x[idx]) + " the usual for this material",
+            "qty_vs_usual": "quantity " + _times(qty_x[idx]) + " the usual for this material",
+            "billed_share": "billed " + (feats.loc[idx, "billed_share"] * 100).map("{:,.0f}".format) + "% of PO quantity",
+            "billed_price_vs_po": "billed price " + ((price_ratio[idx] - 1) * 100).map("{:+.0f}".format) + "% vs PO price",
+            "days_to_bill": "billed " + feats.loc[idx, "days_to_bill"].map(lambda d: "—" if pd.isna(d) else f"{d:,.0f}") + " days after the job",
+        }
+        txt = pd.Series("", index=idx)
+        for k, v in words.items():
+            txt = txt.where(top != k, v)
+        ai_text.loc[idx] = "Rare combination — most unusual: " + txt
+    flags["Unusual pattern (AI)"] = a["AI_FLAG"]
+    euros["Unusual pattern (AI)"] = (po_e - b_e).abs().where(a["AI_FLAG"], 0)
+
+    # ---- combine (keep only flagged rows from here on) ----
+    F = pd.DataFrame(flags)
+    keep = F.any(axis=1)
+    if not keep.any():
+        return a.iloc[:0], as_of, int(usable.sum()), excluded_info
+    a = a[keep].copy()
+    F, E = F[keep], pd.DataFrame(euros)[keep].where(F[keep], 0)
+    a["N_ISSUES"] = F.sum(axis=1)
+    (po_q, b_q, po_e, b_e, missing, miss_eur, extra, extra_eur, b_unit, po_unit, price_ratio, price_eur,
+     unit_x, med_unit, qty_x, med_qty) = [x[keep] for x in (
+        po_q, b_q, po_e, b_e, missing, miss_eur, extra, extra_eur, b_unit, po_unit, price_ratio, price_eur,
+        unit_x, med_unit, qty_x, med_qty)]
+    texts = {}
+    texts["Not billed"] = (
+        po_q.map("{:,.0f}".format) + " units on PO (" + _eur(po_e) + "), nothing billed "
+        + a["DAYS_SINCE_JOB"].astype("Int64").astype(str) + " days after the job"
+    )
+    texts["Partially billed"] = (
+        "Billed " + b_q.map("{:,.0f}".format) + " of " + po_q.map("{:,.0f}".format)
+        + " units; " + missing.map("{:,.0f}".format) + " unit(s) (≈" + _eur(miss_eur) + ") not billed"
+    )
+    texts["Billed more than PO qty"] = (
+        "Billed " + b_q.map("{:,.0f}".format) + " units but PO has " + po_q.map("{:,.0f}".format)
+        + " (" + extra.map("{:,.0f}".format) + " extra ≈ " + _eur(extra_eur) + ")"
+    )
+    texts["Billed price ≠ PO price"] = (
+        "Billed €" + b_unit.map("{:,.2f}".format) + "/unit vs PO €" + po_unit.map("{:,.2f}".format)
+        + "/unit (" + ((price_ratio - 1) * 100).map("{:+.0f}".format) + "%, " + _eur(price_eur)
+        + np.where(price_eur > 0, " more", " less") + ")"
+    )
+    texts["Unusual PO price"] = (
+        "PO price €" + po_unit.map("{:,.2f}".format) + "/unit is " + _times(unit_x)
+        + " the usual €" + med_unit.map("{:,.2f}".format) + " for this material"
+    )
+    texts["Unusual quantity"] = (
+        po_q.map("{:,.0f}".format) + " units on one job is " + _times(qty_x)
+        + " the usual " + med_qty.map("{:,.0f}".format) + " for this material"
+    )
+    texts["Unusual pattern (AI)"] = ai_text[keep]
+
+    a["EUR_AT_STAKE"] = E.max(axis=1).round(2)  # checks overlap, so take the largest, not the sum
+    rule_E = E.drop(columns="Unusual pattern (AI)")
+    rule_F = F.drop(columns="Unusual pattern (AI)")
+    main = rule_E.where(rule_F, -1).idxmax(axis=1).where(rule_F.any(axis=1), "Unusual pattern (AI)")
+    a["MAIN_ISSUE"] = pd.Categorical(main, categories=CHECK_ORDER)
     expl = pd.Series("", index=a.index, dtype=object)
-    for flag, text in [
-        (a["RULE_NO_BILLING"], "PO exists but not billed"),
-        (a["RULE_NO_PO"], "Billed without PO"),
-        (a["RULE_HIGH_USAGE_DIFF"], "Usage difference > 20%"),
-        (a["RULE_HIGH_EURO_DIFF"], "€ difference > 20%"),
-        (a["STAT_OUTLIER"], "Statistical outlier (" + a["TOP_STAT_DRIVER"].astype(str) + ")"),
-        (a["AI_FLAG"], "AI anomaly (" + a["AI_DRIVER"].astype(str) + ")"),
-    ]:
-        expl = expl.where(~flag, expl + "; " + text)
-    a["ANOMALY_EXPLANATION"] = expl.str.lstrip("; ")
-    return a, ml_ok
+    for c in CHECK_ORDER:
+        sep = pd.Series(np.where(expl == "", "", " | "), index=a.index)
+        expl = expl.where(~F[c], expl + sep + texts[c].astype(str))
+    a["EXPLANATION"] = expl
+    a["ISSUES"] = [", ".join(c for c, v in zip(CHECK_ORDER, row) if v) for row in F[CHECK_ORDER].to_numpy()]
+    a["ACTION"] = a["MAIN_ISSUE"].astype(str).map(ACTIONS)
+
+    level = np.select([a["EUR_AT_STAKE"] >= hi_eur, a["EUR_AT_STAKE"] >= med_eur], [2, 1], default=0)
+    level = np.minimum(level + (F["Unusual pattern (AI)"] & rule_F.any(axis=1)).to_numpy().astype(int), 2)
+    a["PRIORITY"] = pd.Categorical(np.array(["🟢 Low", "🟡 Medium", "🔴 High"])[level], categories=["🔴 High", "🟡 Medium", "🟢 Low"])
+    for c in CHECK_ORDER:
+        a["_F_" + c] = F[c]
+        a["_E_" + c] = E[c]
+    a = a.sort_values(["PRIORITY", "EUR_AT_STAKE"], ascending=[True, False])
+    return a, as_of, int(usable.sum()), excluded_info
 
 
 with tab_anomaly:
     st.subheader("AI Anomaly Analysis")
-    with st.expander("How AI Anomaly Detection Works", expanded=False):
-        st.markdown(f"""
-Analysis runs on **Job ID × Material ID** combinations (usage counted in {unit_word}).
-
-**1. Rule-based checks**
-- PO exists but nothing billed
-- Billed without a PO
-- Usage difference (PO − Billed) above 20% of PO usage — only when both sides exist
-- € difference above 20% of PO € — only when both sides exist
-
-Each triggered rule adds 3 to the Risk Score.
-
-**2. Statistical outliers** — Z-scores of usage difference, € difference, PO €, Billed €, Times Used PO
-and Times Billed. Combos more than 3 standard deviations from the mean are flagged (+2).
-
-**3. AI pattern detection** — an Isolation Forest on the same six features flags the ~3% most unusual
-combinations of values (+5).
-
-**Risk levels:** 🔴 HIGH ≥ 8 · 🟡 MEDIUM ≥ 4 · 🟢 LOW < 4
-
-**AI Driver** is the feature with the most extreme standardised value for that combo.
-""")
-
-    anomaly_df, ml_ok = run_anomaly(jm, (filter_key, USED_COL))
-
-    st.subheader("Rule-Based Findings")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("PO not billed", f"{int(anomaly_df['RULE_NO_BILLING'].sum()):,}")
-    c2.metric("Billed without PO", f"{int(anomaly_df['RULE_NO_PO'].sum()):,}")
-    c3.metric("Usage diff > 20%", f"{int(anomaly_df['RULE_HIGH_USAGE_DIFF'].sum()):,}")
-    c4.metric("€ diff > 20%", f"{int(anomaly_df['RULE_HIGH_EURO_DIFF'].sum()):,}")
-
-    c1, c2 = st.columns(2)
-    c1.metric("Statistical outliers (Z > 3)", f"{int(anomaly_df['STAT_OUTLIER'].sum()):,}")
-    if ml_ok:
-        c2.metric("AI Detected Anomalies", f"{int(anomaly_df['AI_FLAG'].sum()):,}")
-    else:
-        c2.warning("Not enough records for machine-learning analysis.")
-
-    st.subheader("Risk Distribution")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("🔴 High Risk", f"{int((anomaly_df['RISK_LEVEL'] == 'HIGH').sum()):,}")
-    c2.metric("🟡 Medium Risk", f"{int((anomaly_df['RISK_LEVEL'] == 'MEDIUM').sum()):,}")
-    c3.metric("🟢 Low Risk", f"{int((anomaly_df['RISK_LEVEL'] == 'LOW').sum()):,}")
-
-    st.subheader("AI Anomaly Dimensions")
-    ai_dim = (
-        anomaly_df[anomaly_df["AI_FLAG"]]
-        .groupby("AI_DRIVER")
-        .size()
-        .reset_index(name="Anomaly Count")
-        .sort_values("Anomaly Count", ascending=False)
+    st.markdown(
+        "Every **Job × Material** is checked for the problems below. Each finding shows **what is wrong in "
+        "plain words**, the **€ at stake** and a **suggested action**, and the list is ranked by priority and "
+        "money at stake. Peer values (\"usual price\", \"usual quantity\") come from all loaded data."
     )
-    if len(ai_dim):
-        c1, c2 = st.columns([2, 1])
-        c1.bar_chart(ai_dim.set_index("AI_DRIVER"))
-        c2.dataframe(ai_dim, hide_index=True, use_container_width=True)
+
+    with st.expander("⚙️ Settings", expanded=False):
+        s1, s2, s3 = st.columns(3)
+        grace_days = s1.number_input("Days before 'not billed' counts", 0, 365, 90, 15, key="an_grace",
+                                     help="Billing normally follows the job within ~2–3 weeks; 95% within 90 days.")
+        tol = s2.number_input("Price tolerance (%)", 0, 200, 20, 5, key="an_tol",
+                              help="Billed vs PO price per unit may differ by this much before it is flagged.")
+        min_eur = s3.number_input("Ignore findings below (€)", 0, 10_000, 10, 10, key="an_min")
+        s4, s5, s6 = st.columns(3)
+        line_billed_pct = s4.number_input(
+            "Contract / material counts as 'billed per line' from (%) of its lines billed", 0, 100, 20, 5, key="an_lb",
+            help="Many contracts (e.g. budget / mileage) and materials (e.g. tyres) are not billed per PO line in "
+                 "this data. Their unbilled lines are not flagged unless you tick the box on the right.")
+        include_lump = s5.checkbox("Also flag unbilled lines on contracts / materials that are rarely billed per line",
+                                   False, key="an_lump")
+        ai_share = s6.slider("AI: share of combos to flag as unusual (%)", 0.2, 5.0, 1.0, 0.2, key="an_ai")
+        s7, s8 = st.columns(2)
+        hi_eur = s7.number_input("🔴 High priority from (€ at stake)", 0, 1_000_000, 1_000, 100, key="an_hi")
+        med_eur = s8.number_input("🟡 Medium priority from (€ at stake)", 0, 1_000_000, 100, 50, key="an_med")
+
+    settings = (int(grace_days), float(tol), float(min_eur), float(line_billed_pct), bool(include_lump),
+                float(hi_eur), float(med_eur), float(ai_share))
+    ref = reference_stats(merged, data_key, float(line_billed_pct))
+    # Checks always run on ALL loaded data (so the AI learns from everything and a job gets the same
+    # verdict whatever the filters); the sidebar filters then only narrow down what is shown.
+    jm_all = jm if not any(filter_key[1:]) else job_material_base(merged, (data_key,))
+    findings, as_of, n_ai, (n_excl, eur_excl) = run_anomaly(jm_all, ref, (data_key,), settings)
+    if any(filter_key[1:]) and not findings.empty:
+        in_view = pd.MultiIndex.from_frame(findings[JM_KEYS].astype(str)).isin(
+            pd.MultiIndex.from_frame(jm[JM_KEYS].astype(str)))
+        findings = findings[in_view]
+        excl_note = " (whole data set)"
     else:
-        st.info("No AI anomalies detected.")
+        excl_note = ""
+    st.caption(f"Reference date for 'days after the job': {as_of.date()} (latest billing date in the data).")
+    if n_excl:
+        st.info(
+            f"**Not counted as 'Not billed'{excl_note}:** {n_excl:,} unbilled Job × Material (PO value €{eur_excl:,.0f}) on contracts "
+            f"or materials where fewer than {line_billed_pct:.0f}% of lines are billed per line — e.g. budget/mileage "
+            "contracts and tyres, which appear to be billed another way. Tick the box in ⚙️ Settings to include them."
+        )
 
-    st.subheader("Top Anomalies")
-    display_cols = [
-        "JOB_ID_COMBINED", "JOB_DATE", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "CUSTOMER_NAME_COMBINED",
-        "CONTRACT_ID_COMBINED", "VENDOR_C", "STATUS", "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF",
-        "PO_EURO", "BILLED_EURO", "EURO_DIFF", "RULE_COUNT", "MAX_Z_SCORE", "AI_SCORE", "AI_DRIVER",
-        "RISK_LEVEL", "RISK_SCORE", "ANOMALY_EXPLANATION",
-    ]
-    ranked = anomaly_df.sort_values(["RISK_SCORE", "AI_SCORE"], ascending=[False, True])
-    table(ranked[display_cols].head(200))
+    if findings.empty:
+        st.success("No anomalies found with the current filters and settings.")
+    else:
+        # ---- headline ----
+        pr = findings["PRIORITY"].value_counts()
+        with st.container(horizontal=True):
+            st.metric("Job × Material with findings", f"{len(findings):,}", border=True, help=f"Out of {len(jm):,} checked")
+            st.metric("€ at stake", f"{findings['EUR_AT_STAKE'].sum():,.0f}", border=True)
+            st.metric("🔴 High", f"{pr.get('🔴 High', 0):,}", border=True)
+            st.metric("🟡 Medium", f"{pr.get('🟡 Medium', 0):,}", border=True)
+            st.metric("🟢 Low", f"{pr.get('🟢 Low', 0):,}", border=True)
 
-    flagged = ranked[ranked["RISK_LEVEL"] != "LOW"]
-    csv_export(flagged, "Anomaly Report (High + Medium risk)", "PO_Billing_Anomaly_Report.csv", "anomaly")
+        # ---- overview per check ----
+        st.markdown("#### What was found")
+        overview = pd.DataFrame({
+            "Check": CHECK_ORDER,
+            "What it means": [CHECKS[c] for c in CHECK_ORDER],
+            "Job × Material": [int(findings["_F_" + c].sum()) for c in CHECK_ORDER],
+            "€ at stake": [round(findings["_E_" + c].sum(), 0) for c in CHECK_ORDER],
+            "Suggested action": [ACTIONS[c] for c in CHECK_ORDER],
+        })
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            st.dataframe(
+                overview, hide_index=True, use_container_width=True,
+                column_config={
+                    "What it means": st.column_config.TextColumn(width="large"),
+                    "€ at stake": st.column_config.NumberColumn(format="€ %.0f"),
+                },
+            )
+        with c2:
+            st.bar_chart(overview.set_index("Check")["€ at stake"], horizontal=True, y_label="", x_label="€ at stake")
+        st.caption("A Job × Material can have several findings; € at stake per row counts only its largest one, "
+                   "so the per-check totals add up to more than the headline.")
+
+        # ---- where ----
+        st.markdown("#### Where the money at stake sits")
+        w1, w2, w3 = st.columns(3)
+        for col, (field, label) in zip([w1, w2, w3], [("CUSTOMER_NAME_COMBINED", "Customer"), ("VENDOR_C", "Vendor"), ("MATERIAL_DESC_C", "Material")]):
+            top = (findings.groupby(field, observed=True)
+                   .agg(Findings=("EUR_AT_STAKE", "size"), EUR=("EUR_AT_STAKE", "sum"))
+                   .sort_values("EUR", ascending=False).head(10).reset_index()
+                   .rename(columns={field: label, "EUR": "€ at stake"}))
+            col.dataframe(top, hide_index=True, use_container_width=True,
+                          column_config={"€ at stake": st.column_config.NumberColumn(format="€ %.0f")})
+
+        # ---- findings list ----
+        st.markdown("#### Findings")
+        f1, f2, f3 = st.columns([2, 2, 1])
+        sel_checks = f1.multiselect("Check", CHECK_ORDER, key="an_checks", placeholder="All checks")
+        sel_prio = f2.multiselect("Priority", ["🔴 High", "🟡 Medium", "🟢 Low"], default=["🔴 High", "🟡 Medium"], key="an_prio")
+        min_stake = f3.number_input("Min € at stake", 0.0, value=0.0, step=100.0, key="an_minstake")
+        view = findings
+        if sel_checks:
+            view = view[view[["_F_" + c for c in sel_checks]].any(axis=1)]
+        if sel_prio:
+            view = view[view["PRIORITY"].isin(sel_prio)]
+        if min_stake:
+            view = view[view["EUR_AT_STAKE"] >= min_stake]
+
+        show = view[[
+            "PRIORITY", "MAIN_ISSUE", "EXPLANATION", "EUR_AT_STAKE", "ACTION",
+            "JOB_ID_COMBINED", "JOB_DATE", "JOB_TYPE_C", "CUSTOMER_NAME_COMBINED", "CONTRACT_ID_COMBINED",
+            "VENDOR_C", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C",
+            "PO_QTY", "BILLED_QTY", "PO_EURO", "BILLED_EURO", "ISSUES", "AI_SCORE",
+        ]].rename(columns={
+            "PRIORITY": "Priority", "MAIN_ISSUE": "Main issue", "EXPLANATION": "What is wrong",
+            "EUR_AT_STAKE": "€ at stake", "ACTION": "Suggested action", "ISSUES": "All checks triggered",
+            "AI_SCORE": "AI unusualness",
+        })
+        if len(show) > MAX_TABLE_ROWS:
+            st.caption(f"Showing top {MAX_TABLE_ROWS:,} of {len(show):,} findings — use the CSV export for all.")
+        cfg = {
+            "What is wrong": st.column_config.TextColumn(width="large"),
+            "€ at stake": st.column_config.NumberColumn(format="€ %.0f"),
+            "AI unusualness": st.column_config.NumberColumn(help="Higher = rarer pattern. Blank = not scored (no PO price)."),
+        }
+        cfg.update({NICE.get(c, c): st.column_config.DateColumn(format="YYYY-MM-DD") for c in ["JOB_DATE"]})
+        st.dataframe(for_display(show.head(MAX_TABLE_ROWS)), hide_index=True, use_container_width=True, column_config=cfg)
+        csv_export(show, "Anomaly findings", "PO_Billing_Anomaly_Findings.csv", "anomaly")
+
+    with st.expander("ℹ️ How the checks work", expanded=False):
+        st.markdown(f"""
+**Level:** each Job ID × Material ID (quantities in units, amounts in €).
+
+| Check | Flagged when | € at stake |
+|---|---|---|
+| Not billed | PO price ≥ €{min_eur:,.0f}, nothing billed, job older than {grace_days} days, and both the contract and the material have ≥ {line_billed_pct:.0f}% of their lines billed | PO amount |
+| Partially billed | 0 < billed qty < PO qty | PO € × missing share |
+| Billed more than PO qty | billed qty > PO qty | billed € × extra share |
+| Billed price ≠ PO price | billed €/unit differs from PO €/unit by more than {tol:.0f}% | price difference × billed qty |
+| Unusual PO price | PO €/unit ≥ 5× the median for that material; material has ≥ 10 priced lines, a stable price (middle half within ×3) and a median ≥ €1 | (price − median) × qty |
+| Unusual quantity | PO qty ≥ 10× the median for that material and ≥ 10 units | (qty − median) × unit price |
+| Unusual pattern (AI) | Isolation Forest flags the rarest {ai_share:.1f}% of combinations | \\|PO € − billed €\\| |
+
+**How the AI check works:** each combination is described by 5 easy-to-read measures — price vs the usual
+price for the material, quantity vs the usual quantity, share of the PO quantity billed, billed price vs PO
+price, and days from job to billing. An Isolation Forest learns what normal combinations look like and flags
+the rarest ones. The explanation names the measure that is furthest from normal. {n_ai:,} combinations had a PO
+price and could be scored.
+
+**Priority:** 🔴 High if € at stake ≥ €{hi_eur:,.0f}, 🟡 Medium if ≥ €{med_eur:,.0f}, otherwise 🟢 Low.
+A finding confirmed by both a rule and the AI moves up one level.
+
+**Not flagged on purpose:** €0 PO lines (nothing to bill), recent jobs still inside the grace period, and unbilled
+lines on contracts or materials that are rarely billed per line (budget / mileage contracts, tyres) — change this in ⚙️ Settings.
+""")
