@@ -77,6 +77,29 @@ def _text(s, default=""):
     return s.astype("string").str.strip().fillna(default).replace("", default).astype(str)
 
 
+# Dates outside this window are treated as data-entry errors (e.g. year 202 instead of 2023)
+# and set to blank. pandas' standard datetime range is 1677-2262, so years like 202 would crash.
+DATE_MIN, DATE_MAX = pd.Timestamp("1900-01-01"), pd.Timestamp("2100-12-31")
+
+
+def _safe_dates(s):
+    """Parse to datetime64[ns] (no timezone, no time). Returns (dates, number of invalid dates)."""
+    present = s.notna()
+    if isinstance(s.dtype, pd.ArrowDtype) and s.dtype.kind == "M":
+        s = pd.Series(s.to_numpy(dtype=object), index=s.index)  # python datetimes, any year
+    try:
+        d = pd.to_datetime(s, errors="coerce")
+    except (pd.errors.OutOfBoundsDatetime, OverflowError, ValueError, TypeError):
+        d = pd.to_datetime(s.astype("string"), errors="coerce")
+    if isinstance(d.dtype, pd.DatetimeTZDtype):
+        d = d.dt.tz_localize(None)
+    if not pd.api.types.is_datetime64_any_dtype(d):  # e.g. object dtype holding out-of-range dates
+        d = pd.to_datetime(s.astype("string"), errors="coerce")
+    d = d.where(d.isna() | ((d >= DATE_MIN) & (d <= DATE_MAX)))
+    d = d.astype("datetime64[ns]").dt.normalize()
+    return d, int((present & d.isna()).sum())
+
+
 def _normalize_types(df):
     """Make parquet-specific dtypes look like what the CSV reader produces."""
     for c in df.columns:
@@ -84,9 +107,8 @@ def _normalize_types(df):
         if isinstance(s.dtype, pd.ArrowDtype):  # only when a pyarrow dtype backend is in use
             kind = s.dtype.kind
             if kind == "M":
-                if getattr(s.dtype.pyarrow_dtype, "tz", None):
-                    s = s.dt.tz_localize(None)
-                s = s.astype("datetime64[ns]")
+                df[c] = s  # converted safely in prepare_frame (date columns) or left as-is
+                continue
             elif kind in "biuf":
                 s = s.astype("float64")
             else:
@@ -119,12 +141,12 @@ def read_source(name, path, upload):
 def prepare_frame(df, source_name):
     df.columns = df.columns.str.upper().str.strip()
 
+    bad_dates = {}
     for c in ["PO_POSTING_DATE", "BILLING_DT", "FIRST_BILLING_DT", "LAST_BILLING_DT"] + JOB_DATE_CANDIDATES:
         if c in df.columns:
-            d = pd.to_datetime(df[c], errors="coerce")
-            if isinstance(d.dtype, pd.DatetimeTZDtype):
-                d = d.dt.tz_localize(None)
-            df[c] = d.astype("datetime64[ns]").dt.normalize()
+            df[c], n_bad = _safe_dates(df[c])
+            if n_bad:
+                bad_dates[c] = n_bad
 
     had_billing_lines = "BILLING_LINES" in df.columns
     for c in ["PO_QTY", "NET_PRICE_EURO", "BILLED_QTY", "BILLED_AMT_EURO", "BILLING_LINES"]:
@@ -182,16 +204,18 @@ def prepare_frame(df, source_name):
             out["_K_" + c] = df[c]
 
     out["SOURCE_FILE"] = source_name
-    return out
+    return out, bad_dates
 
 
 @st.cache_data(show_spinner="Loading quarterly file(s)...", max_entries=3)
 def load_sources(_sources, cache_key):
     """_sources: list of (name, path_or_None, uploaded_file_or_None). Not hashed;
     cache_key identifies the files (name/size/mtime)."""
-    frames = []
+    frames, date_issues = [], []
     for name, path, upload in _sources:
-        frames.append(prepare_frame(read_source(name, path, upload), name))
+        frame, bad = prepare_frame(read_source(name, path, upload), name)
+        frames.append(frame)
+        date_issues += [f"{name}: {n:,} invalid {col}" for col, n in bad.items()]
 
     df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
@@ -229,7 +253,11 @@ def load_sources(_sources, cache_key):
     ]
     for c in cat_cols:
         df[c] = df[c].astype("category")
-    return df, dropped, job_date_note
+    date_warning = (
+        "Dates outside 1900–2100 were treated as blank (likely typos): " + "; ".join(date_issues)
+        if date_issues else ""
+    )
+    return df, dropped, job_date_note, date_warning
 
 
 @st.cache_data(show_spinner=False, max_entries=3)
@@ -446,10 +474,12 @@ if not sources:
 
 data_key = tuple(sorted(key_parts, key=str))
 try:
-    merged, n_dupes, job_date_note = load_sources(sources, data_key)
+    merged, n_dupes, job_date_note, date_warning = load_sources(sources, data_key)
 except Exception as e:
     st.error(f"Error loading file(s): {e}")
     st.stop()
+if date_warning:
+    st.sidebar.warning(date_warning)
 if n_dupes:
     st.sidebar.caption(f"{n_dupes:,} duplicate PO lines across files removed (newest kept).")
 
