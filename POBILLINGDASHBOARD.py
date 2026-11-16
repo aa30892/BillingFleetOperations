@@ -33,6 +33,23 @@ MAX_TABLE_ROWS = 5_000  # rows rendered in on-screen tables (full data via CSV e
 PO_KEYS = ["JOB_NOTIFICATION_ID", "MATERIAL_ID", "VEHICLE_ID", "PO_POSTING_DATE"]
 JM_KEYS = ["JOB_ID_COMBINED", "MATERIAL_ID_COMBINED"]
 # Used as Job Date when present in the file; otherwise Job Date = earliest PO posting date of the Job ID
+# Country columns: the file may carry the job's, the vendor's and/or the customer's country.
+# The sidebar lets the user pick which one the Country filter uses.
+COUNTRY_SOURCES = {
+    "Job": ["JOB_COUNTRY_CODE", "JOB_COUNTRY", "JOB_COUNTRY_ID", "COUNTRY", "COUNTRY_CODE", "COUNTRY_KEY",
+            "LAND1", "PO_COUNTRY", "SALES_ORG_COUNTRY", "FLEET_COUNTRY"],
+    "Vendor": ["VENDOR_COUNTRY_CODE", "VENDOR_COUNTRY", "VENDOR_COUNTRY_ID", "VEND_COUNTRY"],
+    "Customer": ["CUSTOMER_COUNTRY_ID", "CUSTOMER_COUNTRY_CODE", "CUSTOMER_COUNTRY", "CUST_COUNTRY",
+                 "BILLING_COUNTRY"],
+}
+# Local-currency amounts and currency code, used when present in the file
+LC_PO_CANDIDATES = ["NET_PRICE_LC", "NET_PRICE_LOCAL", "NET_PRICE_LOC", "NET_PRICE_LOCAL_CURRENCY", "NET_PRICE_LCY",
+                    "NET_VALUE_LC", "NET_PRICE_LOCAL_CURR", "NET_PRICE"]
+LC_BILLED_CANDIDATES = ["BILLED_AMT_LC", "BILLED_AMT_LOCAL", "BILLED_AMT_LOC", "BILLED_AMT_LOCAL_CURRENCY",
+                        "BILLED_AMT_LCY", "BILLED_AMT_LOCAL_CURR", "BILLED_AMT"]
+CURRENCY_CANDIDATES = ["PO_CURRENCY", "CURRENCY", "CURRENCY_CODE", "LOCAL_CURRENCY", "LC_CURRENCY", "CURR", "CURR_CD",
+                       "WAERS", "DOC_CURRENCY"]
+BILLED_CURRENCY_CANDIDATES = ["BILLED_CURRENCY", "BILLING_CURRENCY", "BILL_CURRENCY", "BILLED_CURR"]
 JOB_DATE_CANDIDATES = [
     "JOB_DATE", "JOB_DT", "JOB_CREATION_DATE", "JOB_CREATED_DATE", "JOB_CREATE_DT", "JOB_START_DATE",
     "JOB_NOTIFICATION_DATE", "JOB_NOTIFICATION_DT", "NOTIFICATION_DATE", "NOTIFICATION_DT", "NOTIF_DATE",
@@ -166,6 +183,18 @@ def prepare_frame(df, source_name):
     out["MATERIAL_DESC_C"] = _text(_coalesce(df, ["MATERIAL_DESC", "MATL_DESC"]))
     out["FLEET_TYPE_C"] = _text(_coalesce(df, ["FLEET_TYPE", "FLEET_TYPE_PO"]), "Unknown")
     out["JOB_TYPE_C"] = _text(_coalesce(df, ["JOB_TYPE_CODE", "JOB_TYPE_CD"]))
+    for src, cands in COUNTRY_SOURCES.items():
+        out["COUNTRY_" + src.upper()] = _text(_coalesce(df, cands), "Unknown").str.upper().replace("UNKNOWN", "Unknown")
+    out["COUNTRY_C"] = "Unknown"  # set from the chosen source in the sidebar
+    for target, cands in [("CURRENCY_C", CURRENCY_CANDIDATES), ("BILLED_CURRENCY_C", BILLED_CURRENCY_CANDIDATES)]:
+        col = _coalesce(df, cands)
+        out[target] = _text(col, "").str.upper() if col is not None else ""
+    for target, cands in [("NET_PRICE_LC", LC_PO_CANDIDATES), ("BILLED_AMT_LC", LC_BILLED_CANDIDATES)]:
+        vals = pd.Series(np.nan, index=df.index)
+        for c in cands:
+            if c in df.columns:
+                vals = vals.combine_first(pd.to_numeric(_normalize_types(df[[c]].copy())[c], errors="coerce"))
+        out[target] = vals
     out["LICENCE_PLATE_C"] = _text(_coalesce(df, ["LICENCE_PLATE", "LICENCE_PLATE_ID"]))
     veh = _id_str(_coalesce(df, ["VEHICLE_ID"]))
     out["VEHICLE_C"] = veh if veh is not None else out["LICENCE_PLATE_C"]
@@ -248,7 +277,8 @@ def load_sources(_sources, cache_key):
         "JOB_ID_COMBINED", "MATERIAL_ID_COMBINED", "CONTRACT_ID_COMBINED",
         "CUSTOMER_NAME_COMBINED", "CUSTOMER_GROUP", "VENDOR_C", "MATERIAL_DESC_C",
         "FLEET_TYPE_C", "JOB_TYPE_C", "LICENCE_PLATE_C", "VEHICLE_C", "QUARTER",
-        "PO_MONTH", "JOB_MONTH", "SOURCE_FILE",
+        "PO_MONTH", "JOB_MONTH", "SOURCE_FILE", "CURRENCY_C", "BILLED_CURRENCY_C",
+        "COUNTRY_JOB", "COUNTRY_VENDOR", "COUNTRY_CUSTOMER",
     ]
     for c in cat_cols:
         df[c] = df[c].astype("category")
@@ -291,7 +321,7 @@ def job_material_base(_df, cache_key):
     ).reset_index()
     attr_cols = [
         "MATERIAL_DESC_C", "VENDOR_C", "CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED",
-        "CUSTOMER_GROUP", "FLEET_TYPE_C", "JOB_TYPE_C", "LICENCE_PLATE_C", "VEHICLE_C", "QUARTER",
+        "CUSTOMER_GROUP", "FLEET_TYPE_C", "JOB_TYPE_C", "LICENCE_PLATE_C", "VEHICLE_C", "QUARTER", "COUNTRY_C",
     ]
     attrs = _df[JM_KEYS + attr_cols].drop_duplicates(subset=JM_KEYS)
     agg = agg.merge(attrs, on=JM_KEYS, how="left")
@@ -354,6 +384,7 @@ NICE = {
     "VENDOR_C": "Vendor",
     "FLEET_TYPE_C": "Fleet Type",
     "JOB_TYPE_C": "Job Type Code",
+    "COUNTRY_C": "Country",
     "LICENCE_PLATE_C": "Licence Plate",
     "VEHICLE_C": "Vehicle ID",
     "QUARTER": "Quarter",
@@ -388,7 +419,9 @@ NICE = {
 
 
 def for_display(df):
-    """Rename to friendly headers."""
+    """Rename to friendly headers; hide Country when the file has no country data."""
+    if "COUNTRY_C" in df.columns and (df["COUNTRY_C"].astype(str) == "Unknown").all():
+        df = df.drop(columns="COUNTRY_C")
     return df.rename(columns=NICE)
 
 
@@ -487,6 +520,61 @@ options = filter_options(merged, data_key)
 # ------------------------------------------------------------------
 # SIDEBAR — usage measure + filters
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# SIDEBAR — amounts in euro or local currency
+# ------------------------------------------------------------------
+@st.cache_data(show_spinner=False, max_entries=3)
+def currency_info(_df, cache_key):
+    has_lc = bool(_df["NET_PRICE_LC"].notna().any() or _df["BILLED_AMT_LC"].notna().any())
+    cur = _df.loc[_df["CURRENCY_C"].astype(str) != "", "CURRENCY_C"].astype(str).value_counts()
+    return has_lc and len(cur) > 0, list(cur.index)
+
+
+has_local, currencies = currency_info(merged, data_key)
+with st.sidebar:
+    st.header("Amounts")
+    if has_local:
+        amount_mode = st.radio("Show amounts in", ["Euro (€)", "Local currency"], index=0, key="amount_mode",
+                               horizontal=True)
+    else:
+        amount_mode = st.radio(
+            "Show amounts in", ["Euro (€)", "Local currency"], index=0, key="amount_mode", horizontal=True,
+            disabled=True,
+            help="The loaded file only has euro amounts. Add local-currency amounts and a currency code to the "
+                 "extract (e.g. NET_PRICE_LC, BILLED_AMT_LC and CURRENCY) and this switch becomes available.",
+        )
+    local_cur = None
+    if amount_mode == "Local currency" and has_local:
+        local_cur = st.selectbox(
+            "Currency", currencies, key="amount_currency",
+            help="Amounts in different currencies can't be added up, so one currency is shown at a time. "
+                 "Only PO lines in this currency are included.",
+        )
+
+n_converted = 0
+if local_cur:
+    # Lines whose PO is in the chosen currency. Billing done in another currency (e.g. PO in GBP, billed
+    # in EUR) is converted at the exchange rate implied by that line's own PO (local ÷ euro amount).
+    m = merged[merged["CURRENCY_C"].astype(str) == local_cur]
+    bill_cur = m["BILLED_CURRENCY_C"].astype(str)
+    other_cur = (bill_cur != "") & (bill_cur != local_cur) & m["BILLED_AMT_EURO"].notna()
+    rate = (m["NET_PRICE_LC"] / m["NET_PRICE_EURO"]).where(m["NET_PRICE_EURO"] > 0)
+    rate = rate.fillna(rate.median() if rate.notna().any() else 1.0)
+    billed_local = m["BILLED_AMT_LC"].where(~other_cur, m["BILLED_AMT_EURO"] * rate)
+    n_converted = int(other_cur.sum())
+    merged = m.assign(NET_PRICE_EURO=m["NET_PRICE_LC"], BILLED_AMT_EURO=billed_local)
+    CUR, CUR_PREFIX = local_cur, local_cur + " "
+else:
+    CUR, CUR_PREFIX = "€", "€"
+CUR_FMT = CUR_PREFIX + "%.0f"
+STAKE = f"{CUR} at stake"
+for _k, _v in list(NICE.items()):
+    NICE[_k] = _v.replace("€", CUR)
+if n_converted:
+    st.sidebar.caption(f"{n_converted:,} {local_cur} PO lines were billed in another currency; their billed amount "
+                       f"is converted to {local_cur} at the PO line's own exchange rate.")
+view_key = (data_key, local_cur)  # every cached result depends on the data AND the currency view
+
 with st.sidebar:
     st.header("Usage Measure")
     measure = st.radio(
@@ -499,6 +587,27 @@ with st.sidebar:
     USED_COL, BILLED_COL = ("PO_QTY", "BILLED_QTY") if measure.startswith("Units") else ("PO_LINES", "BILL_LINES")
 
     st.header("Filters")
+    country_srcs = [s_ for s_ in COUNTRY_SOURCES if (merged["COUNTRY_" + s_.upper()].astype(str) != "Unknown").any()]
+    country_src = None
+    if country_srcs:
+        if len(country_srcs) > 1:
+            country_src = st.radio(
+                "Country of the", country_srcs, horizontal=True, key="country_src",
+                help="Job = where the work was done · Vendor = the vendor's country · Customer = the customer's country.",
+            )
+        else:
+            country_src = country_srcs[0]
+        merged["COUNTRY_C"] = merged["COUNTRY_" + country_src.upper()]
+        country_opts = sorted(str(x) for x in merged["COUNTRY_C"].astype(str).unique())
+        sel_countries = st.multiselect(f"Country ({country_src.lower()})", country_opts, key="filter_countries")
+    else:
+        st.multiselect(
+            "Country", [], key="filter_countries", disabled=True, placeholder="No country column in the file",
+            help="The loaded file has no country column. Add one to the extract (e.g. JOB_COUNTRY_CODE, "
+                 "VENDOR_COUNTRY_CODE or CUSTOMER_COUNTRY_ID) and this filter fills in automatically.",
+        )
+        sel_countries = []
+    view_key = view_key + (country_src,)
     sel_quarters = st.multiselect("Quarter", options["QUARTER"], key="filter_quarters")
     sel_contracts = st.multiselect("Contract ID", options["CONTRACT_ID_COMBINED"], key="filter_contracts")
     sel_groups = st.multiselect("Customer Group", options["CUSTOMER_GROUP"], key="filter_customer_groups")
@@ -542,6 +651,7 @@ with st.sidebar:
 # ------------------------------------------------------------------
 mask = pd.Series(True, index=merged.index)
 for col, sel in [
+    ("COUNTRY_C", sel_countries),
     ("QUARTER", sel_quarters),
     ("CONTRACT_ID_COMBINED", sel_contracts),
     ("CUSTOMER_GROUP", sel_groups),
@@ -569,7 +679,7 @@ if job_range and len(job_range) == 2:
 
 filtered = merged[mask] if not mask.all() else merged
 filter_key = (
-    data_key, tuple(sel_quarters), tuple(sel_contracts), tuple(sel_groups), tuple(sel_customers),
+    view_key, tuple(sel_countries), tuple(sel_quarters), tuple(sel_contracts), tuple(sel_groups), tuple(sel_customers),
     tuple(sel_vendors), tuple(sel_materials), tuple(sel_jobs), date_key, job_date_key,
 )
 
@@ -602,9 +712,9 @@ with tab_dashboard:
     with st.container(horizontal=True):
         st.metric("PO Lines", f"{len(filtered):,}", border=True)
         st.metric("Job × Material combos", f"{len(jm):,}", border=True)
-        st.metric("Total PO €", f"{total_po:,.2f}", border=True)
-        st.metric("Total Billed €", f"{total_billed:,.2f}", border=True)
-        st.metric("€ Diff (PO − Billed)", f"{price_diff:,.2f}", border=True)
+        st.metric(f"Total PO {CUR}", f"{total_po:,.2f}", border=True)
+        st.metric(f"Total Billed {CUR}", f"{total_billed:,.2f}", border=True)
+        st.metric(f"{CUR} Diff (PO − Billed)", f"{price_diff:,.2f}", border=True)
     with st.container(horizontal=True):
         st.metric(f"Times Used PO ({unit_word})", f"{used_total:,.0f}", border=True)
         st.metric(f"Times Billed ({unit_word})", f"{billed_total:,.0f}", border=True)
@@ -656,7 +766,7 @@ with tab_dashboard:
 
     st.subheader("Detail Table — Job × Material with Job Type, Contract, Customer and Job Date")
     detail_cols = [
-        "JOB_ID_COMBINED", "JOB_DATE", "JOB_TYPE_C", "CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED",
+        "JOB_ID_COMBINED", "JOB_DATE", "JOB_TYPE_C", "COUNTRY_C", "CONTRACT_ID_COMBINED", "CUSTOMER_NAME_COMBINED",
         "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "STATUS",
         "TIMES_USED_PO", "TIMES_BILLED", "USAGE_DIFF",
         "PO_EURO", "BILLED_EURO", "EURO_DIFF",
@@ -698,7 +808,7 @@ with tab_jm:
         st.metric("Combos shown", f"{len(jm_view):,}", border=True)
         st.metric(f"Times Used PO ({unit_word})", f"{jm_view['TIMES_USED_PO'].sum():,.0f}", border=True)
         st.metric(f"Times Billed ({unit_word})", f"{jm_view['TIMES_BILLED'].sum():,.0f}", border=True)
-        st.metric("€ Diff (PO − Billed)", f"{jm_view['EURO_DIFF'].sum():,.2f}", border=True)
+        st.metric(f"{CUR} Diff (PO − Billed)", f"{jm_view['EURO_DIFF'].sum():,.2f}", border=True)
 
     jm_cols = [
         "JOB_ID_COMBINED", "JOB_DATE", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C", "STATUS",
@@ -831,7 +941,7 @@ def reference_stats(_merged, cache_key, line_billed_pct):
 
 
 def _eur(x):
-    return "€" + pd.Series(x).abs().map("{:,.0f}".format)
+    return CUR_PREFIX + pd.Series(x).abs().map("{:,.0f}".format)
 
 
 def _times(x):
@@ -973,13 +1083,13 @@ def run_anomaly(_jm, _ref, cache_key, settings):
         + " (" + extra.map("{:,.0f}".format) + " extra ≈ " + _eur(extra_eur) + ")"
     )
     texts["Billed price ≠ PO price"] = (
-        "Billed €" + b_unit.map("{:,.2f}".format) + "/unit vs PO €" + po_unit.map("{:,.2f}".format)
+        "Billed " + CUR_PREFIX + b_unit.map("{:,.2f}".format) + "/unit vs PO " + CUR_PREFIX + po_unit.map("{:,.2f}".format)
         + "/unit (" + ((price_ratio - 1) * 100).map("{:+.0f}".format) + "%, " + _eur(price_eur)
         + np.where(price_eur > 0, " more", " less") + ")"
     )
     texts["Unusual PO price"] = (
-        "PO price €" + po_unit.map("{:,.2f}".format) + "/unit is " + _times(unit_x)
-        + " the usual €" + med_unit.map("{:,.2f}".format) + " for this material"
+        "PO price " + CUR_PREFIX + po_unit.map("{:,.2f}".format) + "/unit is " + _times(unit_x)
+        + " the usual " + CUR_PREFIX + med_unit.map("{:,.2f}".format) + " for this material"
     )
     texts["Unusual quantity"] = (
         po_q.map("{:,.0f}".format) + " units on one job is " + _times(qty_x)
@@ -1014,7 +1124,7 @@ with tab_anomaly:
     st.subheader("AI Anomaly Analysis")
     st.markdown(
         "Every **Job × Material** is checked for the problems below. Each finding shows **what is wrong in "
-        "plain words**, the **€ at stake** and a **suggested action**, and the list is ranked by priority and "
+        f"plain words**, the **{STAKE}** and a **suggested action**, and the list is ranked by priority and "
         "money at stake. Peer values (\"usual price\", \"usual quantity\") come from all loaded data."
     )
 
@@ -1024,7 +1134,7 @@ with tab_anomaly:
                                      help="Billing normally follows the job within ~2–3 weeks; 95% within 90 days.")
         tol = s2.number_input("Price tolerance (%)", 0, 200, 20, 5, key="an_tol",
                               help="Billed vs PO price per unit may differ by this much before it is flagged.")
-        min_eur = s3.number_input("Ignore findings below (€)", 0, 10_000, 10, 10, key="an_min")
+        min_eur = s3.number_input(f"Ignore findings below ({CUR})", 0, 10_000, 10, 10, key="an_min")
         s4, s5, s6 = st.columns(3)
         line_billed_pct = s4.number_input(
             "Contract / material counts as 'billed per line' from (%) of its lines billed", 0, 100, 20, 5, key="an_lb",
@@ -1034,16 +1144,16 @@ with tab_anomaly:
                                    False, key="an_lump")
         ai_share = s6.slider("AI: share of combos to flag as unusual (%)", 0.2, 5.0, 1.0, 0.2, key="an_ai")
         s7, s8 = st.columns(2)
-        hi_eur = s7.number_input("🔴 High priority from (€ at stake)", 0, 1_000_000, 1_000, 100, key="an_hi")
-        med_eur = s8.number_input("🟡 Medium priority from (€ at stake)", 0, 1_000_000, 100, 50, key="an_med")
+        hi_eur = s7.number_input(f"🔴 High priority from ({STAKE})", 0, 1_000_000, 1_000, 100, key="an_hi")
+        med_eur = s8.number_input(f"🟡 Medium priority from ({STAKE})", 0, 1_000_000, 100, 50, key="an_med")
 
     settings = (int(grace_days), float(tol), float(min_eur), float(line_billed_pct), bool(include_lump),
                 float(hi_eur), float(med_eur), float(ai_share))
-    ref = reference_stats(merged, data_key, float(line_billed_pct))
+    ref = reference_stats(merged, view_key, float(line_billed_pct))
     # Checks always run on ALL loaded data (so the AI learns from everything and a job gets the same
     # verdict whatever the filters); the sidebar filters then only narrow down what is shown.
-    jm_all = jm if not any(filter_key[1:]) else job_material_base(merged, (data_key,))
-    findings, as_of, n_ai, (n_excl, eur_excl) = run_anomaly(jm_all, ref, (data_key,), settings)
+    jm_all = jm if not any(filter_key[1:]) else job_material_base(merged, (view_key,))
+    findings, as_of, n_ai, (n_excl, eur_excl) = run_anomaly(jm_all, ref, (view_key,), settings)
     if any(filter_key[1:]) and not findings.empty:
         in_view = pd.MultiIndex.from_frame(findings[JM_KEYS].astype(str)).isin(
             pd.MultiIndex.from_frame(jm[JM_KEYS].astype(str)))
@@ -1054,7 +1164,7 @@ with tab_anomaly:
     st.caption(f"Reference date for 'days after the job': {as_of.date()} (latest billing date in the data).")
     if n_excl:
         st.info(
-            f"**Not counted as 'Not billed'{excl_note}:** {n_excl:,} unbilled Job × Material (PO value €{eur_excl:,.0f}) on contracts "
+            f"**Not counted as 'Not billed'{excl_note}:** {n_excl:,} unbilled Job × Material (PO value {CUR_PREFIX}{eur_excl:,.0f}) on contracts "
             f"or materials where fewer than {line_billed_pct:.0f}% of lines are billed per line — e.g. budget/mileage "
             "contracts and tyres, which appear to be billed another way. Tick the box in ⚙️ Settings to include them."
         )
@@ -1066,7 +1176,7 @@ with tab_anomaly:
         pr = findings["PRIORITY"].value_counts()
         with st.container(horizontal=True):
             st.metric("Job × Material with findings", f"{len(findings):,}", border=True, help=f"Out of {len(jm):,} checked")
-            st.metric("€ at stake", f"{findings['EUR_AT_STAKE'].sum():,.0f}", border=True)
+            st.metric(STAKE, f"{findings['EUR_AT_STAKE'].sum():,.0f}", border=True)
             st.metric("🔴 High", f"{pr.get('🔴 High', 0):,}", border=True)
             st.metric("🟡 Medium", f"{pr.get('🟡 Medium', 0):,}", border=True)
             st.metric("🟢 Low", f"{pr.get('🟢 Low', 0):,}", border=True)
@@ -1077,7 +1187,7 @@ with tab_anomaly:
             "Check": CHECK_ORDER,
             "What it means": [CHECKS[c] for c in CHECK_ORDER],
             "Job × Material": [int(findings["_F_" + c].sum()) for c in CHECK_ORDER],
-            "€ at stake": [round(findings["_E_" + c].sum(), 0) for c in CHECK_ORDER],
+            STAKE: [round(findings["_E_" + c].sum(), 0) for c in CHECK_ORDER],
             "Suggested action": [ACTIONS[c] for c in CHECK_ORDER],
         })
         c1, c2 = st.columns([3, 2])
@@ -1086,12 +1196,12 @@ with tab_anomaly:
                 overview, hide_index=True, use_container_width=True,
                 column_config={
                     "What it means": st.column_config.TextColumn(width="large"),
-                    "€ at stake": st.column_config.NumberColumn(format="€ %.0f"),
+                    STAKE: st.column_config.NumberColumn(format=CUR_FMT),
                 },
             )
         with c2:
-            st.bar_chart(overview.set_index("Check")["€ at stake"], horizontal=True, y_label="", x_label="€ at stake")
-        st.caption("A Job × Material can have several findings; € at stake per row counts only its largest one, "
+            st.bar_chart(overview.set_index("Check")[STAKE], horizontal=True, y_label="", x_label=STAKE)
+        st.caption(f"A Job × Material can have several findings; {STAKE} per row counts only its largest one, "
                    "so the per-check totals add up to more than the headline.")
 
         # ---- where ----
@@ -1101,16 +1211,16 @@ with tab_anomaly:
             top = (findings.groupby(field, observed=True)
                    .agg(Findings=("EUR_AT_STAKE", "size"), EUR=("EUR_AT_STAKE", "sum"))
                    .sort_values("EUR", ascending=False).head(10).reset_index()
-                   .rename(columns={field: label, "EUR": "€ at stake"}))
+                   .rename(columns={field: label, "EUR": STAKE}))
             col.dataframe(top, hide_index=True, use_container_width=True,
-                          column_config={"€ at stake": st.column_config.NumberColumn(format="€ %.0f")})
+                          column_config={STAKE: st.column_config.NumberColumn(format=CUR_FMT)})
 
         # ---- findings list ----
         st.markdown("#### Findings")
         f1, f2, f3 = st.columns([2, 2, 1])
         sel_checks = f1.multiselect("Check", CHECK_ORDER, key="an_checks", placeholder="All checks")
         sel_prio = f2.multiselect("Priority", ["🔴 High", "🟡 Medium", "🟢 Low"], default=["🔴 High", "🟡 Medium"], key="an_prio")
-        min_stake = f3.number_input("Min € at stake", 0.0, value=0.0, step=100.0, key="an_minstake")
+        min_stake = f3.number_input(f"Min {STAKE}", 0.0, value=0.0, step=100.0, key="an_minstake")
         view = findings
         if sel_checks:
             view = view[view[["_F_" + c for c in sel_checks]].any(axis=1)]
@@ -1121,19 +1231,19 @@ with tab_anomaly:
 
         show = view[[
             "PRIORITY", "MAIN_ISSUE", "EXPLANATION", "EUR_AT_STAKE", "ACTION",
-            "JOB_ID_COMBINED", "JOB_DATE", "JOB_TYPE_C", "CUSTOMER_NAME_COMBINED", "CONTRACT_ID_COMBINED",
+            "JOB_ID_COMBINED", "JOB_DATE", "JOB_TYPE_C", "COUNTRY_C", "CUSTOMER_NAME_COMBINED", "CONTRACT_ID_COMBINED",
             "VENDOR_C", "MATERIAL_ID_COMBINED", "MATERIAL_DESC_C",
             "PO_QTY", "BILLED_QTY", "PO_EURO", "BILLED_EURO", "ISSUES", "AI_SCORE",
         ]].rename(columns={
             "PRIORITY": "Priority", "MAIN_ISSUE": "Main issue", "EXPLANATION": "What is wrong",
-            "EUR_AT_STAKE": "€ at stake", "ACTION": "Suggested action", "ISSUES": "All checks triggered",
+            "EUR_AT_STAKE": STAKE, "ACTION": "Suggested action", "ISSUES": "All checks triggered",
             "AI_SCORE": "AI unusualness",
         })
         if len(show) > MAX_TABLE_ROWS:
             st.caption(f"Showing top {MAX_TABLE_ROWS:,} of {len(show):,} findings — use the CSV export for all.")
         cfg = {
             "What is wrong": st.column_config.TextColumn(width="large"),
-            "€ at stake": st.column_config.NumberColumn(format="€ %.0f"),
+            STAKE: st.column_config.NumberColumn(format=CUR_FMT),
             "AI unusualness": st.column_config.NumberColumn(help="Higher = rarer pattern. Blank = not scored (no PO price)."),
         }
         cfg.update({NICE.get(c, c): st.column_config.DateColumn(format="YYYY-MM-DD") for c in ["JOB_DATE"]})
@@ -1142,17 +1252,17 @@ with tab_anomaly:
 
     with st.expander("ℹ️ How the checks work", expanded=False):
         st.markdown(f"""
-**Level:** each Job ID × Material ID (quantities in units, amounts in €).
+**Level:** each Job ID × Material ID (quantities in units, amounts in {CUR}).
 
-| Check | Flagged when | € at stake |
+| Check | Flagged when | {STAKE} |
 |---|---|---|
-| Not billed | PO price ≥ €{min_eur:,.0f}, nothing billed, job older than {grace_days} days, and both the contract and the material have ≥ {line_billed_pct:.0f}% of their lines billed | PO amount |
-| Partially billed | 0 < billed qty < PO qty | PO € × missing share |
-| Billed more than PO qty | billed qty > PO qty | billed € × extra share |
-| Billed price ≠ PO price | billed €/unit differs from PO €/unit by more than {tol:.0f}% | price difference × billed qty |
-| Unusual PO price | PO €/unit ≥ 5× the median for that material; material has ≥ 10 priced lines, a stable price (middle half within ×3) and a median ≥ €1 | (price − median) × qty |
+| Not billed | PO price ≥ {CUR_PREFIX}{min_eur:,.0f}, nothing billed, job older than {grace_days} days, and both the contract and the material have ≥ {line_billed_pct:.0f}% of their lines billed | PO amount |
+| Partially billed | 0 < billed qty < PO qty | PO {CUR} × missing share |
+| Billed more than PO qty | billed qty > PO qty | billed {CUR} × extra share |
+| Billed price ≠ PO price | billed {CUR}/unit differs from PO {CUR}/unit by more than {tol:.0f}% | price difference × billed qty |
+| Unusual PO price | PO {CUR}/unit ≥ 5× the median for that material; material has ≥ 10 priced lines, a stable price (middle half within ×3) and a median ≥ {CUR}1 | (price − median) × qty |
 | Unusual quantity | PO qty ≥ 10× the median for that material and ≥ 10 units | (qty − median) × unit price |
-| Unusual pattern (AI) | Isolation Forest flags the rarest {ai_share:.1f}% of combinations | \\|PO € − billed €\\| |
+| Unusual pattern (AI) | Isolation Forest flags the rarest {ai_share:.1f}% of combinations | \\|PO {CUR} − billed {CUR}\\| |
 
 **How the AI check works:** each combination is described by 5 easy-to-read measures — price vs the usual
 price for the material, quantity vs the usual quantity, share of the PO quantity billed, billed price vs PO
@@ -1160,9 +1270,9 @@ price, and days from job to billing. An Isolation Forest learns what normal comb
 the rarest ones. The explanation names the measure that is furthest from normal. {n_ai:,} combinations had a PO
 price and could be scored.
 
-**Priority:** 🔴 High if € at stake ≥ €{hi_eur:,.0f}, 🟡 Medium if ≥ €{med_eur:,.0f}, otherwise 🟢 Low.
+**Priority:** 🔴 High if {CUR} at stake ≥ {CUR_PREFIX}{hi_eur:,.0f}, 🟡 Medium if ≥ {CUR_PREFIX}{med_eur:,.0f}, otherwise 🟢 Low.
 A finding confirmed by both a rule and the AI moves up one level.
 
-**Not flagged on purpose:** €0 PO lines (nothing to bill), recent jobs still inside the grace period, and unbilled
+**Not flagged on purpose:** zero-price PO lines (nothing to bill), recent jobs still inside the grace period, and unbilled
 lines on contracts or materials that are rarely billed per line (budget / mileage contracts, tyres) — change this in ⚙️ Settings.
 """)
